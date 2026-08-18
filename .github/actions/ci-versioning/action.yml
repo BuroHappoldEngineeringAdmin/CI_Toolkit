@@ -1,0 +1,749 @@
+name: "CI Versioning"
+description: |
+  Validates backward compatibility by deserialising historical JSON datasets
+  against the current codebase.
+
+  Caveat: this check does not enforce that [PreviousVersion] attributes were
+  added for renamed or removed types. A missing attribute causes the BHoM
+  serialiser to log "No upgrade for X" and continue gracefully, and the
+  check passes. Code review is the only enforcement for that case.
+
+inputs:
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+  versioning_toolkit_repo:
+    description: >
+      Versioning_Toolkit repository (owner/repo). Must expose
+      .ci/code/Verification.sln whose post-build stages datasets to
+      C:\ProgramData\BHoM\Datasets\TestSets\Versioning. Override to
+      point at a fork.
+    required: false
+    default: 'BHoM/Versioning_Toolkit'
+  test_toolkit_repo:
+    description: >
+      Test_Toolkit repository (owner/repo). Override to point at a fork.
+    required: false
+    default: 'BHoM/Test_Toolkit'
+  additional_dataset_repos:
+    description: >
+      Newline-separated list of repositories (owner/repo) to clone and
+      build before tests run, used to stage supplementary versioning
+      datasets alongside the primary toolkit.
+    required: false
+    default: ''
+  revit_mock_support_repos:
+    description: >
+      Repos seeded into the dependency closure solely so the Revit API mock
+      solution can build. The mock code generator calls
+      BH.Engine.Adapters.File.Compute.ReadFromJsonFile, resolved through a
+      HintPath into ProgramData, so File_Engine.dll must be present or the
+      generator fails with CS0234 and the whole mock solution build fails.
+      A caller whose own closure already provides it pays nothing extra
+      (resolve-dependencies de-duplicates seeds).
+    required: false
+    default: 'BHoM/File_Toolkit'
+  revit_mock_repo:
+    description: >
+      Repository supplying IL-only mock Autodesk assemblies (RevitAPI,
+      RevitAPIUI, AdWindows, UIFramework, UIFrameworkServices) so Revit
+      methods whose signatures reference Autodesk types can be verified.
+      The real RevitAPI is mixed-mode native and cannot load on .NET 5+.
+      Provisioning soft-skips when the closure has no year-suffixed Revit
+      assemblies, or when the repo cannot be cloned or built, in which case
+      those methods are reported as unverified rather than verified.
+    required: false
+    # The repository name below is deliberate, not an oversight. This input is the
+    # sole source of the value for every caller, and changing it silently soft-skips
+    # mock provisioning rather than failing a check.
+    default: 'BuroHappoldEngineering/RevitAPIMock'
+  dotnet_version:
+    description: >
+      .NET SDK version shared by the dep build (resolve-dependencies) and the
+      runner publish (prepare-runner). The runner binary and the assemblies it
+      reflects over must be built with the same toolchain.
+    required: false
+    default: '8.0'
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout PR branch
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 0
+
+    - name: Compute changed files
+      id: changed
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        # AssemblyInfo.cs is excluded to match BHoMBot's Versioning.cs:49: a
+        # milestone version bump touches it fleet-wide and cannot change the
+        # outcome, because the result is a function of the built assemblies and
+        # the datasets, not of the file that changed. Same exclusion as
+        # ci-serialisation. The token is wildcarded so it matches at any depth;
+        # a bare 'AssemblyInfo.cs' would anchor to the repo root and match
+        # nothing (see tests/test-changed-file-patterns.sh).
+        patterns: '*.cs *.csproj *.sln :(exclude)*AssemblyInfo.cs'
+        skip_if_not_pr: 'false'
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    - name: Resolve dependencies
+      id: deps
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode: caller
+        dotnet_version: ${{ inputs.dotnet_version }}
+        configuration: Release
+        token: ${{ steps.dep-token.outputs.token }}
+        additional_seeds: |
+          ${{ inputs.test_toolkit_repo }}
+          ${{ inputs.versioning_toolkit_repo }}
+          ${{ inputs.additional_dataset_repos }}
+          ${{ inputs.revit_mock_support_repos }}
+
+    - name: Ensure BHoM Upgrades directory
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # resolve-dependencies caches Assemblies but not Upgrades. On a cache
+        # hit BHoMUpgrades' post-build never fires, leaving the Upgrades
+        # directory absent, which makes Versioning_Engine throw
+        # DirectoryNotFoundException (Versioning_Engine/Query/Converter.cs).
+        # Copy the static v*.json upgrades from the source tree as a fallback.
+        $vtkParts     = "${{ inputs.versioning_toolkit_repo }}".Split('/', 2)
+        $vtkDepsDir   = "C:\bhom-deps\$($vtkParts[1])"
+        $upgradesDir  = "C:\ProgramData\BHoM\Upgrades\BHoMUpgrades\Upgrades"
+        $upgradesSrc  = "$vtkDepsDir\BHoMUpgrades\Upgrades"
+        if (-not (Test-Path $upgradesDir)) {
+          if (Test-Path $upgradesSrc) {
+            Write-Host "::notice::Upgrades directory absent. Copying static upgrade JSONs from the source tree."
+            New-Item -ItemType Directory -Force -Path $upgradesDir | Out-Null
+            Copy-Item "$upgradesSrc\*.json" $upgradesDir -Force
+          } else {
+            Write-Host "::warning::$upgradesSrc not found. Versioning_Engine may fail."
+          }
+        }
+
+    - name: Discover primary solution
+      id: solution
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/discover-solution@develop
+      with:
+        check_title: Versioning
+
+    - name: Build primary repo
+      id: build_subject
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # -clp:ErrorsOnly for the same reason as #179 on dependency builds: this build
+        # is a means to an end, and its compiler warnings become annotations on a
+        # versioning check. Measured on BHoM/Revit_Toolkit#1683: 24 annotations, of
+        # which 2 were versioning findings and 9 were 'ParameterType' is obsolete.
+        # ci-build is the check that should surface build warnings; this is not it.
+        dotnet restore "${{ steps.solution.outputs.path }}"
+        dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m -clp:ErrorsOnly
+
+    # There is deliberately no build-completeness fast-fail here any more.
+    #
+    # A "Fast-fail on missing versioning-critical DLLs" step used to download
+    # IncludedDLLs.txt from the baseline installer's latest release and assert every
+    # canonical DLL in it was present in ProgramData. It was removed 2026-08-07 as a
+    # latent fleet-wide outage, on two measurements:
+    #
+    #   1. It had never executed. Zero of the last 100 BHoM/BHoM_Installer releases and
+    #      zero of the last 30 BuroHappoldEngineering/BuroHappold_Installer releases
+    #      carry IncludedDLLs.txt, so all eight prod runs sampled that day logged
+    #      "No release carrying IncludedDLLs.txt ... Skipping fast-fail".
+    #   2. Had a baseline ever appeared it would have failed almost every repo. The
+    #      expected set is the whole installer payload (measured: 165 canonical DLLs,
+    #      including 31 adapters spanning ETABS, GSA, Lusas, RFEM, Robot, SAP2000 and
+    #      more) while ProgramData here holds only the calling repo's closure.
+    #      BHoM/Revit_Toolkit declares 5 dependencies; it can never contain
+    #      ETABS_Adapter.dll. Each repo also gets its own resolve-dependencies cache
+    #      key, so nothing accumulates across repos.
+    #
+    # It worked on BHoMBot only because CloneInstaller builds the entire installer set
+    # before versioning, making its ProgramData fleet-complete. That precondition does
+    # not hold in per-repo CI, which is the same mistake as the old 3-segment
+    # attribution filter and the Revit mock closure dependency.
+    #
+    # Do not reintroduce it against a fleet-wide baseline. The vacuous-run risk it was
+    # meant to cover is already reported, per repo and without blocking, by the
+    # zero-subject-namespace warning in VersioningRunner (RunCommand.BuildSubjectNamespaces).
+
+    - name: Locate Verification.sln
+      id: ver_sln
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # Resolve order: bhom-deps first, workspace as fallback. Most callers
+        # bring Versioning_Toolkit in via additional_seeds; the workspace path
+        # only matches when Versioning_Toolkit itself is the calling repo.
+        # bhom-deps takes priority to avoid picking up an unrelated
+        # .ci/code/Verification.sln in the caller (e.g. BHoM_Engine ships one
+        # for its Engine_Test suite).
+        $vtkParts   = "${{ inputs.versioning_toolkit_repo }}".Split('/', 2)
+        $vtkDepsDir = "C:\bhom-deps\$($vtkParts[1])"
+        $candidates = @(
+          "$vtkDepsDir\.ci\code\Verification.sln",
+          (Join-Path "${{ github.workspace }}" ".ci\code\Verification.sln")
+        )
+        $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $found) {
+          Write-Host "::error title=Versioning::Verification.sln not found in $vtkDepsDir or workspace."
+          Write-Host "Ensure '${{ inputs.versioning_toolkit_repo }}' is the calling repo or listed in additional_seeds."
+          exit 1
+        }
+        "path=$found" | Out-File $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice title=Verification.sln::$found"
+
+    - name: Infer Verification.sln build configuration
+      id: ver_config
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/infer-verification-config@develop
+      with:
+        sln_path: ${{ steps.ver_sln.outputs.path }}
+
+    # The mock repo is private, and this action runs on public repositories, so its
+    # name must not be interpolated into a step body or a warning: both are echoed
+    # into a publicly readable log. Measured on BHoM/Revit_Toolkit run 30649588347:
+    # four log lines carried it on every run, whether the mock build succeeded or
+    # failed. Two mitigations here:
+    #   1. add-mask, so any later occurrence renders as ***
+    #   2. env rather than inline ${{ }}, so the value is not printed in the
+    #      rendered script body of each step
+    # One residual line remains and cannot be removed from inside the action: the
+    # runner echoes a composite action's resolved inputs when the action starts,
+    # before any step can register a mask. Removing that requires the value to stop
+    # being an action input, which trades disclosure against configurability and is
+    # not decided here.
+    - name: Resolve Revit mock repo owner
+      id: mock_owner
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      env:
+        MOCK_REPO: ${{ inputs.revit_mock_repo }}
+      run: |
+        echo "::add-mask::$MOCK_REPO"
+        echo "::add-mask::${MOCK_REPO%%/*}"
+        echo "owner=${MOCK_REPO%%/*}" >> "$GITHUB_OUTPUT"
+
+    # Scoped to the mock repo's own org, not the caller's. The default dependency
+    # token is minted for github.repository_owner, so a caller in another org
+    # cannot read a private mock repo and the clone fails looking like a missing
+    # repository. continue-on-error because the App may not be installed on that
+    # owner, which must degrade to the soft skip below rather than fail the job.
+    - name: Mint Revit mock token
+      id: mock-token
+      if: steps.changed.outputs.count != '0'
+      continue-on-error: true
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+        owner:          ${{ steps.mock_owner.outputs.owner }}
+
+    - name: Provision Revit API mocks
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      env:
+        GH_TOKEN:  ${{ steps.mock-token.outputs.token || steps.dep-token.outputs.token }}
+        MOCK_REPO: ${{ inputs.revit_mock_repo }}
+      run: |
+        # The real RevitAPI.dll is mixed-mode native (PE32+, ILONLY=False) and cannot be
+        # loaded on .NET 5+ at all, so every Revit method whose signature references an
+        # Autodesk type is unverifiable without a stand-in. The mock repo builds IL-only
+        # body-less proxies under one assembly identity (RevitAPI 9.0.0.0) covering all
+        # Revit years. Measured effect: raw failures across the closure 1454 -> 4.
+        #
+        # Ordering matters twice. After resolve-dependencies, because that action saves
+        # the ProgramData cache with an explicit save step, so anything written here
+        # cannot leak into the cached assembly set other checks restore. Before
+        # Verification.sln, matching BHoMBot's CloneInstaller.cs, which places the mocks
+        # ahead of the versioning build so [PreviousVersion] attributes are scraped.
+        #
+        # Every failure path is a soft skip: without mocks the check still runs and
+        # reports those methods as unverified, which is the pre-existing behaviour. A
+        # hard failure here would block PRs over an unrelated private-repo dependency.
+        $asmDir = 'C:\ProgramData\BHoM\Assemblies'
+        $yearly = @(Get-ChildItem -Path $asmDir -Filter '*.dll' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match 'Revit_.+20\d{2}\.dll$' })
+        if ($yearly.Count -eq 0) {
+          Write-Host "::notice title=Versioning::No year-suffixed Revit assemblies in the closure, so Revit API mocks are not needed."
+          exit 0
+        }
+
+        $repo = $env:MOCK_REPO
+        $root = Join-Path $env:RUNNER_TEMP 'revit-api-mock'
+        Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+        gh repo clone $repo $root -- --depth 1 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $root)) {
+          Write-Host "::warning title=Versioning::Could not clone the configured Revit API mock repository, so Revit API mocks are unavailable. Revit methods whose signatures reference Autodesk types will be reported as unverified rather than verified."
+          exit 0
+        }
+
+        $sln = Get-ChildItem -Path $root -Filter '*.sln' -Recurse | Select-Object -First 1
+        if (-not $sln) {
+          Write-Host "::warning title=Versioning::No solution found in the configured Revit API mock repository, so Revit API mocks are unavailable."
+          exit 0
+        }
+
+        dotnet build $sln.FullName -c Release --nologo -v q
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "::warning title=Versioning::Revit API mock build failed, continuing without mocks."
+          exit 0
+        }
+
+        # Copied explicitly rather than relying on the mock projects' own post-build copy,
+        # so what actually landed is logged and an upstream layout change is visible here
+        # instead of surfacing later as unexplained unverified counts.
+        $expected = @('RevitAPI.dll','RevitAPIUI.dll','AdWindows.dll','UIFramework.dll','UIFrameworkServices.dll')
+        $copied = @()
+        foreach ($name in $expected) {
+          $built = Get-ChildItem -Path $root -Filter $name -Recurse -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -like '*\bin\*' -and $_.FullName -notlike '*\obj\*' } |
+                     Select-Object -First 1
+          if ($built) {
+            Copy-Item $built.FullName (Join-Path $asmDir $name) -Force
+            $copied += $name
+          }
+        }
+
+        # "Mocks in place" used to be reported on any non-zero copy count, so a partial
+        # set read as success. That matters because the clone above is unpinned: it takes
+        # the mock repo's default branch, so an upstream rename or a dropped proxy project
+        # yields a green build, a partial copy, and a success notice whose only tell is a
+        # name absent from a five-item list.
+        #
+        # The size floor covers the other half. A proxy built without the code generator
+        # has the correct assembly identity and zero Autodesk.Revit.DB types, which is
+        # worse than no mocks: the identity resolves so nothing soft-skips, while every
+        # type reference still fails and the failures look genuine. Measured on a clean
+        # clone, RevitAPI.dll is 4,608 bytes against a real 187,392; the smallest real
+        # mock, UIFrameworkServices.dll, is 10,752. 8 KB sits below every real assembly
+        # and well above the shell.
+        #
+        # Both stay warnings. Every path in this step is a soft skip by design, because a
+        # hard failure here would block PRs over an unrelated private-repo dependency.
+        $floor      = 8KB
+        $missing    = @($expected | Where-Object { $copied -notcontains $_ })
+        $undersized = @($copied | Where-Object { (Get-Item (Join-Path $asmDir $_)).Length -lt $floor })
+
+        if ($copied.Count -eq 0) {
+          Write-Host "::warning title=Versioning::Revit API mocks built but no expected assembly was found to copy, continuing without mocks."
+        } elseif ($missing.Count -gt 0 -or $undersized.Count -gt 0) {
+          $detail = @()
+          if ($missing.Count -gt 0)    { $detail += "missing: $($missing -join ', ')" }
+          if ($undersized.Count -gt 0) { $detail += "implausibly small: $($undersized -join ', ')" }
+          Write-Host "::warning title=Versioning::Revit API mocks are incomplete ($($detail -join '; ')). Revit methods whose signatures reference Autodesk types may be reported as unverified rather than verified."
+        } else {
+          Write-Host "::notice title=Versioning::Revit API mocks in place ($($copied -join ', ')) alongside $($yearly.Count) year-suffixed Revit assembly file(s)."
+        }
+        exit 0
+
+    - name: Recapture PreviousVersion upgrades
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ steps.dep-token.outputs.token }}
+      run: |
+        # PostBuild.exe writes the current cycle's upgrade file (v93.json) from two
+        # sources: Versioning_NN.json files found by filesystem scan, and
+        # [PreviousVersion] attributes scraped by reflection over the assemblies in
+        # ProgramData (CopyUpgrades.cs:70 LoadAllAssemblies, :226 AllMethodList).
+        # BHoMUpgrades' own PostBuildEvent runs it, but that happens while
+        # resolve-dependencies builds Versioning_Toolkit, which is BEFORE this repo is
+        # built. So an attribute added by the PR under test was never in the upgrade
+        # set, and the check failed the very PRs that correctly annotated a signature
+        # change. Verified on a live PR: a method carrying [PreviousVersion("9.3", ..)]
+        # was still reported as a failure. Verification.sln cannot fix this either, it
+        # contains only TestRunner and Versioning_Test.
+        #
+        # Re-run the same command the csproj runs, from the same working directory,
+        # differing only in when: after this repo's build and after the Revit mocks, so
+        # the scrape sees both. BHoMBot gets this for free because CloneInstaller builds
+        # the whole installer set before rebuilding Versioning_Toolkit ("just to be
+        # safe"). Re-running is safe: CollectMethodVersioning keys entries on the old
+        # signature and replaces a same-key entry, so this refreshes rather than
+        # duplicating. Note it only collects attributes whose FromVersion equals
+        # PostBuild.exe's own FileVersion truncated to two segments, so an attribute
+        # annotated for a different cycle is ignored by design, not by this step.
+        $vtkParts    = "${{ inputs.versioning_toolkit_repo }}".Split('/', 2)
+        $vtkDepsDir  = "C:\bhom-deps\$($vtkParts[1])"
+        $exe         = Join-Path $vtkDepsDir 'PostBuild\Build\PostBuild.exe'
+        $upgradesDir = "C:\ProgramData\BHoM\Upgrades\BHoMUpgrades\Upgrades"
+        $workDir     = Join-Path $vtkDepsDir 'BHoMUpgrades'
+
+        if (-not (Test-Path $upgradesDir)) {
+          Write-Host "::warning title=Versioning::Cannot recapture upgrades, the Upgrades directory is absent. A [PreviousVersion] attribute added by this PR will not be honoured, so a correctly annotated signature change may still be reported as a failure."
+          exit 0
+        }
+
+        # On a dependency cache hit resolve-dependencies restores ProgramData without
+        # cloning anything, so the toolkit source tree is absent, and that is exactly the
+        # run whose upgrade set is stalest: the cached v93.json was scraped against
+        # whatever repo was building when the cache was filled. Build just the tool.
+        # PostBuild.csproj is SDK-style and its references are HintPaths into ProgramData,
+        # which the cache has already restored, so this needs nothing else present.
+        if (-not (Test-Path $exe)) {
+          Write-Host "::notice title=Versioning::Versioning toolkit source absent (dependency cache hit), building PostBuild so upgrades can still be recaptured."
+          $tmp = Join-Path $env:RUNNER_TEMP 'versioning-postbuild'
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          gh repo clone '${{ inputs.versioning_toolkit_repo }}' $tmp -- --depth 1 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp)) {
+            Write-Host "::warning title=Versioning::Could not clone the versioning toolkit to rebuild PostBuild. A [PreviousVersion] attribute added by this PR will not be honoured."
+            exit 0
+          }
+          dotnet build (Join-Path $tmp 'PostBuild\PostBuild.csproj') -c Release --nologo -v q
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning title=Versioning::PostBuild failed to build, so upgrades cannot be recaptured. A [PreviousVersion] attribute added by this PR will not be honoured."
+            exit 0
+          }
+          $exe     = Join-Path $tmp 'PostBuild\Build\PostBuild.exe'
+          $workDir = Join-Path $tmp 'BHoMUpgrades'
+        }
+
+        if (-not (Test-Path $exe) -or -not (Test-Path $workDir)) {
+          Write-Host "::warning title=Versioning::Cannot recapture upgrades (PostBuild.exe or BHoMUpgrades is absent). A [PreviousVersion] attribute added by this PR will not be honoured, so a correctly annotated signature change may still be reported as a failure."
+          exit 0
+        }
+
+        # The version in the filename comes from PostBuild.exe's own FileVersion, the
+        # same way the tool decides which Versioning_NN.json files to scan for, so this
+        # keeps working across version bumps without editing the action.
+        $fv = (Get-Item $exe).VersionInfo.FileVersion
+        $vp = $fv.Split('.')
+        $target = Join-Path $upgradesDir "v$($vp[0])$($vp[1]).json"
+
+        $before = if (Test-Path $target) { (Get-Item $target).LastWriteTimeUtc } else { $null }
+
+        Push-Location $workDir
+        & $exe '..\..\' $target
+        $code = $LASTEXITCODE
+        Pop-Location
+
+        # An unhandled reflection exception inside PostBuild.exe loses the file
+        # silently, so confirm it was actually rewritten rather than trusting exit 0.
+        $after = if (Test-Path $target) { (Get-Item $target).LastWriteTimeUtc } else { $null }
+        if ($code -ne 0 -or $null -eq $after -or ($null -ne $before -and $after -le $before)) {
+          Write-Host "::warning title=Versioning::Upgrade recapture did not update $(Split-Path $target -Leaf) (exit $code). A [PreviousVersion] attribute added by this PR may not be honoured."
+          exit 0
+        }
+
+        Write-Host "::notice title=Versioning::Recaptured PreviousVersion upgrades into $(Split-Path $target -Leaf) ($([int](Get-Item $target).Length) bytes)."
+
+        # Second pass for the OTHER half of the upgrade file: the filesystem scan.
+        # GetVersionFiles (CopyUpgrades.cs:117) globs exactly sourceFolder\*\*\ for
+        # Versioning_NN.json, i.e. <root>\<repo>\<projectDir>\. The pass above inherits
+        # the csproj's '..\..\' argument, which resolves to the dependency root
+        # (C:\bhom-deps), so it covers dependencies but can never see the calling repo:
+        # that is checked out to the workspace, not into bhom-deps. On a dependency cache
+        # hit it is worse, because '..\..\' resolves to RUNNER_TEMP and no source tree is
+        # present there at all. Either way a Versioning_NN.json committed by the PR under
+        # test was ignored, so a declared rename or a MessageForDeleted entry did not
+        # count and the check failed a repo that followed the documented convention.
+        # BHoMBot is immune for the same reason it escaped the attribute-ordering defect:
+        # CloneInstaller puts every repo, subject included, in one folder, so its
+        # '..\..\' root already contains the subject.
+        #
+        # The exe is pointed at the workspace's PARENT, because the glob needs the repo
+        # directory to be the first level. resolve-dependencies also junctions each
+        # C:\bhom-deps\<Dep> into that same parent (for relative HintPath resolution), so
+        # this pass can re-read dependency files as well as the subject's. That is
+        # harmless rather than intended: CreateUpgradeFile merges the file written above
+        # back in and CopyDictionaryAccross only adds keys the target lacks, so a re-read
+        # is idempotent and nothing either pass found is lost. Do not read a precedence
+        # guarantee into the ordering; within one pass the first file read wins a
+        # colliding key, and that order is directory enumeration order.
+        #
+        # The guard is scoped to the calling repo, since that is the only thing this pass
+        # adds, so repos that commit no Versioning_NN.json pay nothing. It looks exactly
+        # one level down to match what the glob can actually reach: a file at the repo
+        # root, or nested deeper than one directory, is invisible to the exe. That
+        # limitation is inherited, and shared with BHoMBot.
+        $scanName    = "Versioning_$($vp[0])$($vp[1]).json"
+        $subjectRoot = Split-Path "${{ github.workspace }}" -Parent
+        $subjectFiles = @(
+          Get-ChildItem -LiteralPath "${{ github.workspace }}" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter $scanName -File -ErrorAction SilentlyContinue }
+        )
+
+        if ($subjectFiles.Count -eq 0) {
+          Write-Host "::notice title=Versioning::No $scanName in the calling repo, so no second upgrade scan is needed."
+          exit 0
+        }
+
+        Write-Host "Found $scanName in the calling repo: $($subjectFiles.FullName -join ', ')"
+        $before = (Get-Item $target).LastWriteTimeUtc
+
+        Push-Location $workDir
+        & $exe $subjectRoot $target
+        $code = $LASTEXITCODE
+        Pop-Location
+
+        $after = if (Test-Path $target) { (Get-Item $target).LastWriteTimeUtc } else { $null }
+        if ($code -ne 0 -or $null -eq $after -or $after -le $before) {
+          Write-Host "::warning title=Versioning::Second upgrade scan did not update $(Split-Path $target -Leaf) (exit $code), so $scanName from this repo may not be honoured."
+          exit 0
+        }
+
+        Write-Host "::notice title=Versioning::Merged the calling repo's $scanName ($($subjectFiles.Count) file(s)) into $(Split-Path $target -Leaf) ($([int](Get-Item $target).Length) bytes)."
+        exit 0
+
+    - name: Build Verification.sln
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        dotnet restore "${{ steps.ver_sln.outputs.path }}"
+        dotnet build "${{ steps.ver_sln.outputs.path }}" --no-restore -c ${{ steps.ver_config.outputs.config }} --nologo
+
+    - name: Validate versioning datasets
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $path = "C:\ProgramData\BHoM\Datasets\TestSets\Versioning"
+        if (-not (Test-Path $path)) {
+          Write-Host "::error title=Versioning::Datasets directory missing at $path. Build Verification.sln PostBuildEvent may not have copied datasets correctly."
+          exit 1
+        }
+        $versions = Get-ChildItem $path -Directory
+        if ($versions.Count -eq 0) {
+          Write-Host "::error title=Versioning::No version directories found in $path."
+          exit 1
+        }
+        Write-Host "::notice title=Versioning::Found versioning datasets for: $($versions.Name -join ', ')"
+
+    - name: Prepare VersioningRunner
+      id: runner
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/prepare-runner@develop
+      with:
+        runner_project: tools/VersioningRunner/src/VersioningRunner/VersioningRunner.csproj
+        output_dir: out\versioning-runner
+        configuration: Release
+        cache_prefix: versioning-runner
+        source_dir: tools/VersioningRunner/src
+        dotnet_version: ${{ inputs.dotnet_version }}
+
+    # Which methods are version-conditional cannot be learned from compiled metadata: #if
+    # leaves no trace, and the runner has no source access. So it is read from the source
+    # here, where the checkout is, and passed in.
+    #
+    # The failure mode is deliberately asymmetric. If this finds nothing, no file is written
+    # and no flag is passed, so every finding records VersionConditional=Unknown. An empty
+    # result must not read as "not version-conditional": those are different states and the
+    # register in CI_Toolkit#173 treats them differently.
+    - name: Collect version-conditional methods
+      id: vercond
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $out = Join-Path $env:GITHUB_WORKSPACE 'version-conditional.txt'
+        $found = New-Object System.Collections.Generic.List[string]
+
+        $files = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter '*.cs' -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -notmatch '[\\/](obj|bin)[\\/]' })
+
+        $condPattern = '^\s*#(if|elif)\b.*REVIT'
+        $declPattern = '\b(?:public|internal|protected|private)\s+(?:static\s+)?[\w<>\[\],\.\?]+\s+(\w+)\s*\('
+
+        foreach ($f in $files) {
+          $lines = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+          if ($lines.Count -eq 0) { continue }
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -notmatch $condPattern) { continue }
+            # The declaration guarded by the directive sits on one of the next few lines.
+            # Take the first that looks like a method signature and record its name.
+            $limit = [Math]::Min($i + 6, $lines.Count)
+            for ($j = $i + 1; $j -lt $limit; $j++) {
+              $m = [regex]::Match($lines[$j], $declPattern)
+              if ($m.Success) { $found.Add($m.Groups[1].Value); break }
+            }
+          }
+        }
+
+        # The file is written whenever the scan completes, even with nothing to list. A
+        # present-but-empty file is the assertion "scanned, none found", which lets the
+        # runner record No. Most of the fleet is non-Revit and will land here: 75 of the 92
+        # alpha and beta repos. Withholding the file for them would leave every versioning
+        # divergence unscored and the gate in CI_Toolkit#173 unsatisfiable.
+        #
+        # The file is withheld only if the scan itself could not run, which is the honest
+        # Unknown case.
+        $uniq = @($found | Sort-Object -Unique)
+        $header = "# scanned $($files.Count) source file(s) for #if/#elif REVIT"
+        @($header) + $uniq | Set-Content -LiteralPath $out -Encoding utf8
+        "file=$out" | Out-File $env:GITHUB_OUTPUT -Append
+        if ($uniq.Count -gt 0) {
+          Write-Host "Version-conditional methods found: $($uniq.Count) ($($uniq -join ', '))"
+        } else {
+          Write-Host "Scanned $($files.Count) source file(s); no version-conditional methods. Findings record No, not Unknown."
+        }
+
+    - name: Run versioning tests
+      id: run
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # --subject-assemblies restricts attribution to the namespaces this repo's own
+        # assemblies declare. Without it, failures are attributed on a 3-segment
+        # namespace prefix over the whole dependency closure, which cannot distinguish
+        # BH.oM.Adapters.File from BH.oM.Adapters.ETABS: the v9.2 datasets name thousands
+        # of types a per-repo closure never builds, and every one is blamed on the repo.
+        # Measured on a real PR: 1056 of 1056 failures belonged to other repos.
+        # stdout only is tee'd, deliberately without 2>&1.
+        #
+        # The coverage evidence the summary needs is on stdout: Attribution
+        # (RunCommand.cs:47,65) and Classification (:120) are Console.WriteLine.
+        # The per-finding annotations are on stderr (:172, Console.Error.WriteLine).
+        #
+        # Merging the two with 2>&1 breaks annotations. PowerShell converts the
+        # redirected stderr into ErrorRecord objects, and once they pass through a
+        # pipeline the '::error ...' text no longer reaches the runner as a plain
+        # line, so no annotation is created. Measured on a sandbox validation run:
+        # Classification reported real/SignatureResolved=2 while zero finding
+        # annotations were produced, against two on a comparable production run.
+        & "${{ steps.runner.outputs.runner_exe }}" `
+            --assemblies         'C:\ProgramData\BHoM\Assemblies' `
+            --subject-assemblies "${{ github.workspace }}\Build" `
+            --configuration      'Release' `
+            $(if ('${{ steps.vercond.outputs.file }}') { '--version-conditional', '${{ steps.vercond.outputs.file }}' }) `
+            --output             'versioning-result.json' |
+          Tee-Object -FilePath 'versioning-stdout.txt'
+        "exit_code=$LASTEXITCODE" | Out-File $env:GITHUB_OUTPUT -Append
+
+    # One summary step for both outcomes. A green that says only "all tests passed"
+    # is unfalsifiable: it reads identically whether 18 namespaces were verified or
+    # zero methods were discovered, which is the silent-vacuous-pass shape the audit
+    # records seven times. So the summary states coverage first and the verdict second,
+    # for a pass and a failure alike.
+    - name: Write to Job Summary
+      if: always() && steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # An infrastructure failure and a versioning finding need different action
+        # from the developer, and the job conclusion does not distinguish them. A
+        # dependency build failure previously showed as a red versioning check with
+        # no indication that versioning never ran. Measured on Revit_UI#696.
+        $infraStep = ''
+        if     ("${{ steps.deps.conclusion }}"          -eq 'failure') { $infraStep = 'Resolve dependencies' }
+        elseif ("${{ steps.build_subject.conclusion }}" -eq 'failure') { $infraStep = 'Build primary repo' }
+
+        if ($infraStep) {
+          @(
+            "### Versioning did not run"
+            ""
+            "Failed in: $infraStep"
+            ""
+            "The dependency closure did not build, so no versioning comparison was made."
+            "This is not a versioning finding. See the ci-build check on this pull request"
+            "for the same failure."
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+        }
+
+        $failed = "${{ steps.run.outputs.exit_code }}" -ne '0'
+
+        $attribution = '(not reported)'
+        $classification = '(not reported)'
+        if (Test-Path 'versioning-stdout.txt') {
+          $out = Get-Content 'versioning-stdout.txt' -Raw
+          if ($out -match 'Attribution:\s*(.+)')    { $attribution    = $Matches[1].Trim() }
+          if ($out -match 'Classification:\s*(.+)') { $classification = $Matches[1].Trim() }
+        }
+
+        $rows = @()
+        $unverified = 0
+        $coverage = $null
+        $configuration = $null
+        if (Test-Path 'versioning-result.json') {
+          $r = Get-Content 'versioning-result.json' -Raw | ConvertFrom-Json
+          $coverage = $r.Coverage
+          $configuration = $r.Configuration
+          foreach ($d in @($r.Diagnostics)) {
+            if ($d.CountedAsReal) {
+              # Context per finding. VersionConditional is tri-state: Unknown means the
+              # source was never inspected, which is not the same as No.
+              $context = @()
+              if ($d.VersionConditional -eq 'Yes') { $context += 'signature is version-conditional' }
+              if ($d.DeclaringTypeCandidates) {
+                $context += "declaring type in $(@($d.DeclaringTypeCandidates).Count) assemblies"
+              }
+              $rows += [pscustomobject]@{
+                Label   = $d.Label
+                Path    = $d.Path
+                Cause   = $d.Cause
+                Context = if ($context.Count -gt 0) { $context -join '; ' } else { '' }
+              }
+            } else { $unverified++ }
+          }
+        }
+
+        $head = if ($failed) { "Versioning failed: $($rows.Count) regression(s)" }
+                else         { "Versioning passed" }
+
+        $md = @("### $head", "")
+        $md += "**Coverage.** Attribution: $attribution"
+        $md += ""
+        $md += "| | |"
+        $md += "|---|---|"
+        $md += "| Classification | ``$classification`` |"
+        $md += "| Reported unverified | $unverified |"
+        if ($coverage) {
+          $md += "| Surface examined | $($coverage.SubjectTypes) subject types across $($coverage.SubjectAssemblies) subject assemblies |"
+          $md += "| Dataset versions | $(if ($coverage.DatasetVersions -eq 0) { 'all staged' } else { 'previous only' }) |"
+          $md += "| Assemblies loaded | $($coverage.LoadedAssemblies) |"
+          $md += "| FromJsonDatasets entry points invoked | $($coverage.VerifyEntryPoints) |"
+        }
+        $md += "| Build configuration | ``$(if ($configuration) { $configuration } else { 'not recorded' })`` |"
+        $md += ""
+
+        if ($rows.Count -gt 0) {
+          $md += "#### Findings"
+          $md += ""
+          $md += "| Method | Classification | Blocking type | Known cause |"
+          $md += "|---|---|---|---|"
+          foreach ($x in ($rows | Select-Object -First 25)) {
+            $md += "| ``$($x.Label)`` | $($x.Path) | ``$($x.Cause)`` | $($x.Context) |"
+          }
+          if ($rows.Count -gt 25) { $md += "" ; $md += "$($rows.Count - 25) further finding(s) are in the ``versioning-result.json`` artefact." }
+        } else {
+          $md += "No methods counted as real regressions. Unverified methods are listed in the ``versioning-result.json`` artefact."
+        }
+
+        $md | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Fail job on versioning regression
+      if: steps.changed.outputs.count != '0' && steps.run.outputs.exit_code != '0'
+      shell: pwsh
+      run: exit 1
+
+    - name: Upload results
+      if: always() && steps.changed.outputs.count != '0'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: versioning-results-${{ github.run_id }}
+        path: versioning-result.json
+        if-no-files-found: ignore
+        retention-days: 14

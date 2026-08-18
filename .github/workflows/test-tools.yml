@@ -1,0 +1,53 @@
+# Unit tests for the .NET runners this repo ships from tools/.
+#
+# lint-workflows covers the YAML and the bash pathspec suite, but its paths filter
+# lists only .github/workflows, .github/actions, .github/scripts and templates. Nothing
+# matched tools/**, so a pull request touching only the runners received no checks at
+# all: PR #131 reported zero. That left every runner regression test inert, including the
+# one added in #131 to stop the System.Drawing.Common reference being dropped as unused.
+#
+# Compliance.Tests is deliberately NOT run here. Compliance.Shared references BHoM.dll,
+# BHoM_Engine.dll, CodeComplianceTest_oM.dll, Test_Engine.dll and Test_oM.dll by HintPath
+# out of C:\ProgramData\BHoM\Assemblies, so it cannot even compile without a BHoM install
+# plus a built Test_Toolkit. Adding it needs the dependency-resolution step and belongs in
+# a separate change; a job that fails for environmental reasons is worse than no job.
+name: Test Tools
+
+on:
+  pull_request:
+    paths:
+      - 'tools/**'
+  # The pull request that introduces this file touches only .github/workflows, so it
+  # cannot trigger itself. Dispatch is how you validate it before relying on it.
+  workflow_dispatch:
+
+concurrency:
+  group: test-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dotnet-tests:
+    name: dotnet tests
+    # windows-latest rather than ubuntu-latest. The runners are Windows-only in
+    # production (ProgramData paths, Revit assemblies), and HostDependencyTests asserts
+    # a property of the host rather than of the code, so it is only meaningful on the
+    # host the runners actually execute on.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+        with:
+          dotnet-version: '8.0'
+
+      - name: SerialiserRunner tests
+        run: dotnet test tools/SerialiserRunner/src/SerialiserRunner.Tests --nologo
+
+      - name: VersioningRunner tests
+        run: dotnet test tools/VersioningRunner/src/VersioningRunner.Tests --nologo

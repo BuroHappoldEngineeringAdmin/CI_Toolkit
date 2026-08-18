@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      net8.0-windows, not net8.0, matching SerialiserRunner for the same reason.
+      BHoM's Revit UI assemblies reference WPF, so on a plain net8.0 host
+      PresentationFramework resolves to nothing: GetTypes() throws
+      ReflectionTypeLoadException, and reading Type.Namespace on the partial
+      results throws too. BuildSubjectNamespaces then loses those namespaces, and
+      a failure in one of them cannot be attributed to the repo that owns it, so
+      it is silently dropped rather than reported.
+
+      Measured against the real 547-assembly closure with the Revit mocks present,
+      so this isolates the WPF cause from the RevitAPIUI one:
+
+        subject                     net8.0                         net8.0-windows
+        Revit_MechanicalPlumbing    115 null, 35 unreadable, 15 ns  0, 0, 17 ns
+        Revit_ElementRelationships   95 null, 20 unreadable,  4 ns  0, 0,  5 ns
+        Revit_Tagging                75 null, 10 unreadable,  7 ns  0, 0,  8 ns
+
+      The recovered namespaces are the UI ones (e.g.
+      BH.Revit.UI.MechanicalPlumbing.Windows.Controls), which were previously
+      invisible to attribution.
+
+      This moves toward BHoMBot rather than away from it: its VersioningProcess.exe
+      is .NET Framework, where these assemblies have always resolved. The plain
+      net8.0 host was the divergence.
+    -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>VersioningRunner</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VersioningRunner.Tests" />
+    <!--
+      UseWPF/UseWindowsForms swap the implicit-usings set and System.IO is not in
+      the replacement, so Path/File/Directory stop resolving. Restored here rather
+      than by adding usings across the source, since the cause is the TFM change
+      and belongs next to it.
+    -->
+    <Using Include="System.IO" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      BHoM types compiled against .NET Framework / netstandard reference
+      System.Drawing.Common with the 4.0.0.1 assembly identity. On .NET 8 Windows
+      this package supplies the runtime implementation so System.Drawing.Bitmap
+      and friends resolve via reflection. Without it, invoking
+      BH.Test.Versioning.Verify.FromJsonDatasets throws TypeLoadException for any
+      dataset whose object graph touches a Bitmap-bearing type.
+    -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+  </ItemGroup>
+</Project>

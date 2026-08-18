@@ -1,0 +1,52 @@
+# Build artifacts
+bin/
+obj/
+out/
+Debug/
+Release/
+
+# VS & Rider
+.vs/
+.idea/
+
+# Dotnet tools / temp
+*.user
+*.suo
+*.tmp
+*.cache
+*.pdb
+*.mdb
+
+# Logs
+*.log
+
+# Local environment files
+*.env
+*.local
+
+# SARIF output (generated in CI before upload)
+*.sarif
+
+# Compliance runner scratch directories
+sarif_parts/
+
+# Dependency prep directories used in CI or local dev
+deps/
+deps-assemblies/
+_toolkit/
+_assemblies/
+_runner_source/
+
+# Coverage
+coverage/
+TestResults/
+*.coverage
+*.coveragexml
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Claude / AI session artefacts (plans and session notes are transient; specs are tracked)
+docs/session-notes/
+docs/superpowers/plans/

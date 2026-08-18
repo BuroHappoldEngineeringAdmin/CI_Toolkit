@@ -1,0 +1,133 @@
+name: Compute changed files
+description: >
+  Diffs the PR against its base SHA and emits the count of files matching
+  the supplied pathspecs. Callers use the count to skip expensive steps
+  when no relevant files changed. The matched list can optionally be
+  written to disk for downstream consumers (format script, runners).
+
+inputs:
+  patterns:
+    description: >
+      Space-separated git pathspecs (e.g. '*.cs *.csproj *.sln'), passed
+      as trailing -- args to git diff.
+    required: true
+  skip_if_not_pr:
+    description: >
+      Default 'true': emit count=0 and exit when the trigger was not a
+      pull request. Set 'false' for workflows that should also run on
+      push (build, unit-tests).
+    default: 'true'
+  output_file:
+    description: >
+      Path to write the newline-separated list of matched files. Required
+      by consumers that read the list directly (check-format-pr.sh,
+      compliance runners).
+    default: ''
+
+outputs:
+  count:
+    description: >
+      Number of files matching the given pathspecs, deletions included.
+      '0' signals callers to skip; any other value signals proceed. May
+      exceed the output_file line count, which excludes deletions.
+    value: ${{ steps.compute.outputs.count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute changed files
+      id: compute
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        SKIP_IF_NOT_PR: ${{ inputs.skip_if_not_pr }}
+        PATTERNS: ${{ inputs.patterns }}
+        OUTPUT_FILE: ${{ inputs.output_file }}
+      run: |
+        set -euo pipefail
+
+        # BASE_SHA is the pull-request DETECTOR, not the diff endpoint. It comes
+        # from the event payload, so it is present exactly when this ran from a
+        # pull_request and absent in any other context (push, workflow_dispatch).
+        #
+        # Deliberately not replaced by a git-based probe such as
+        # `git rev-parse HEAD^2`: that would couple detection to the merge-ref
+        # shape, and if the shape ever changed the failure would present as
+        # "not triggered from a pull request" rather than as an error. A wrong
+        # answer that looks like a legitimate skip is the worst available
+        # failure mode for this action, because every consumer treats count=0
+        # as "nothing to do".
+        if [ -z "$BASE_SHA" ]; then
+          if [ "$SKIP_IF_NOT_PR" = "true" ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not triggered from a pull request. Check skipped."
+          else
+            echo "count=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not triggered from a pull request. Running unconditionally."
+          fi
+          exit 0
+        fi
+
+        # The diff range is HEAD^1..HEAD, not BASE_SHA..HEAD.
+        #
+        # No check action passes `ref:` to actions/checkout, so all take the
+        # default, which for a pull_request event is refs/pull/<n>/merge. HEAD is
+        # therefore a merge of the PR head into a commit on the base branch.
+        # Confirmed from a production run log rather than from documentation:
+        #   HEAD is now at 55c3688 Merge 0951f558... into 51879278...
+        # So HEAD^1 is the base commit the merge was computed against, and
+        # HEAD^1..HEAD is exactly this pull request's contribution to that merge.
+        #
+        # BASE_SHA..HEAD was wrong. base.sha is pinned at pull-request creation
+        # while the merge ref tracks a later base tip, so that range also
+        # contained everything merged into the base branch since the pull request
+        # was opened. Measured on a production run: 22 files selected for a
+        # pattern covering a subset of file types, on a pull request GitHub
+        # reports as changing 17 files in total. Sampled across 15 open pull
+        # requests, base.sha was behind the current base tip in 13.
+        #
+        # BASE_SHA...HEAD would not have fixed it. base.sha is an ancestor of
+        # HEAD, so the merge base IS base.sha and three-dot collapses to
+        # two-dot; and under a shallow fetch there is no local merge base, so it
+        # errors rather than computing.
+        #
+        # HEAD^1 must be present locally. Consumers using fetch-depth: 0
+        # (ci-serialisation, ci-versioning) already have it. Those using
+        # fetch-depth: 1 have only the merge commit, so deepen by one. Kept here
+        # rather than raising fetch-depth in each consumer so the range and its
+        # precondition stay in one place.
+        if ! git rev-parse --verify --quiet 'HEAD^1' >/dev/null 2>&1; then
+          git fetch --depth=2 origin "$(git rev-parse HEAD)"
+        fi
+
+        # Fail loudly rather than falling back to a wider range. A silent
+        # fallback would reintroduce the over-selection this replaced, and it
+        # would do so invisibly.
+        if ! git rev-parse --verify --quiet 'HEAD^1' >/dev/null 2>&1; then
+          echo "::error title=compute-changed-files::Could not resolve HEAD^1." \
+               "Expected HEAD to be a pull-request merge commit (refs/pull/<n>/merge)." \
+               "If actions/checkout was given an explicit ref, this action's diff range no longer applies."
+          exit 1
+        fi
+
+        read -ra pathspecs <<< "$PATTERNS"
+
+        # Two diffs with different filters, for different consumers:
+        #   count (skip decision)  ACMRTD — deletions included. Deleting a
+        #     file can break a build or change check outcomes, so a
+        #     deletion-only PR must still run the check.
+        #   output_file (file list) ACMRT — deletions excluded, so
+        #     downstream tools never attempt to read a file that is absent
+        #     from the working tree.
+        if [ -n "$OUTPUT_FILE" ]; then
+          git diff --name-only --diff-filter=ACMRT 'HEAD^1' HEAD -- "${pathspecs[@]}" > "$OUTPUT_FILE"
+        fi
+        count=$(git diff --name-only --diff-filter=ACMRTD 'HEAD^1' HEAD -- "${pathspecs[@]}" | wc -l | tr -d ' ')
+
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+
+        if [ "$count" -gt 0 ]; then
+          echo "::notice::$count relevant file(s) changed."
+        else
+          echo "::notice::No relevant files changed. Check skipped."
+        fi

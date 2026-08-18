@@ -1,0 +1,230 @@
+name: "Resolve BHoM Dependencies"
+description: |
+  Resolves, builds, and caches BHoM dependency assemblies for a caller repo.
+  Clones into an isolated root (C:\bhom-deps\) outside the workspace, builds
+  with the configured SDK, and stages DLLs to ProgramData\BHoM\Assemblies
+  via each repo's PostBuildEvent. Supports two resolution modes: caller-graph
+  (the caller's dependencies.txt) and seeds (an explicit repo list).
+
+inputs:
+  deps_file:
+    description: Path to the caller repo's dependencies.txt (used when mode=caller).
+    required: false
+    default: "dependencies.txt"
+
+  dotnet_version:
+    description: >
+      .NET SDK version to build dependencies with (e.g. '8.0'). Pinned via
+      a generated global.json at the clone root, so dep builds use this
+      version regardless of other SDKs present on the runner.
+    required: false
+    default: "8.0"
+
+  configuration:
+    description: Build configuration (Release/Debug).
+    required: false
+    default: "Release"
+
+  token:
+    description: GitHub token or PAT for cloning private dependency repositories.
+    required: false
+    default: ""
+
+  mode:
+    description: |
+      Resolution mode:
+        caller  Build only the caller repo's dependency graph (default).
+        seeds   Build only the supplied seed repos and their graphs.
+    required: false
+    default: "caller"
+
+  seeds:
+    description: Newline-separated owner/repo[@ref] list (used when mode=seeds).
+    required: false
+    default: ""
+
+  additional_seeds:
+    description: |
+      Newline-separated owner/repo[@ref] list of extra seed repos to build
+      alongside the caller's dependency graph. Used when a job needs the
+      caller's own dependencies plus a fixed set of infrastructure repos
+      (e.g. Test_Toolkit + Versioning_Toolkit for data-driven tests).
+      Ignored when mode=seeds.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+      with:
+        dotnet-version: ${{ inputs.dotnet_version }}
+
+    # Split restore + save: post-step auto-save does not fire inside
+    # cross-repo composite actions, so saves are explicit steps below.
+    - name: Restore NuGet cache
+      id: nuget-cache
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.nuget/packages
+          ~\AppData\Local\Microsoft\MSBuild\Cache
+        # dotnet_version is intentionally not part of the key: NuGet
+        # binaries are SDK-version-agnostic for net8.0 targets.
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj','**/nuget.config') }}
+        restore-keys: ${{ runner.os }}-nuget-
+
+    - name: Prepare folders
+      shell: pwsh
+      run: |
+        # deps/ holds graph metadata (_shas.txt, _order.txt, _selection.txt).
+        New-Item -ItemType Directory -Force -Path deps | Out-Null
+        New-Item -ItemType File   -Force -Path deps/_shas.txt | Out-Null
+        if (Test-Path deps/_order.txt)     { Remove-Item deps/_order.txt -Force }
+        if (Test-Path deps/_selection.txt) { Remove-Item deps/_selection.txt -Force }
+
+        # Clone deps to a drive-root directory so no Directory.Build.props
+        # from the caller workspace leaks into dep builds.
+        New-Item -ItemType Directory -Force -Path "C:\bhom-deps" | Out-Null
+
+        # Pin the SDK via global.json at the clone root. Without this dotnet
+        # selects the highest installed SDK. `rollForward: latestMinor`
+        # accepts any patch of the requested minor.
+        $sdkVersion = "${{ inputs.dotnet_version }}"
+        if ($sdkVersion -match '^\d+\.\d+$') { $sdkVersion = "$sdkVersion.0" }
+        [ordered]@{ sdk = [ordered]@{ version = $sdkVersion; rollForward = "latestMinor" } } `
+            | ConvertTo-Json | Set-Content "C:\bhom-deps\global.json" -Encoding utf8
+
+        # BHoM repos' PostBuildEvent xcopies into this path. Recreate it from
+        # empty so its content is exactly what the cache restore or this
+        # run's builds produce: leftover DLLs from any earlier population
+        # would let undeclared dependencies resolve via HintPath and mask a
+        # missing dependencies.txt entry.
+        $asm = "$env:ProgramData\BHoM\Assemblies"
+        if (Test-Path $asm) { Remove-Item $asm -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $asm | Out-Null
+
+        # BHoMUpgrades' PostBuildEvent stages upgrade definitions here, and
+        # the assembly cache carries this directory alongside Assemblies
+        # (see the restore step), so recreate it from empty for the same
+        # reason as above.
+        $upg = "$env:ProgramData\BHoM\Upgrades"
+        if (Test-Path $upg) { Remove-Item $upg -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $upg | Out-Null
+
+    # Resolved from C:\bhom-deps so the global.json written above governs,
+    # i.e. this is the SDK that actually builds the deps (e.g. 8.0.422),
+    # not the newest SDK on the runner image. It feeds the assembly cache
+    # key: a dep set that cold-builds under one SDK may not under another,
+    # so a cached entry is only valid for the SDK that produced it.
+    - name: Resolve SDK version for cache key
+      id: sdk
+      shell: pwsh
+      run: |
+        "version=$(dotnet --version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      working-directory: C:\bhom-deps
+
+    - name: Resolve dependency graph
+      shell: pwsh
+      env:
+        PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        DEP_TOKEN: ${{ inputs.token }}
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Resolve-DependencyGraph.ps1"
+
+        & $script `
+          -DepsFile "${{ inputs.deps_file }}" `
+          -Mode "${{ inputs.mode }}" `
+          -Seeds "${{ inputs.seeds }}" `
+          -AdditionalSeeds "${{ inputs.additional_seeds }}" `
+          -CloneRoot "C:\bhom-deps"
+
+    - name: Compute cache key from dependency SHAs
+      id: shas
+      shell: pwsh
+      run: |
+        if (-not (Test-Path 'deps/_shas.txt')) {
+          "keypart=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          exit 0
+        }
+
+        $pairs = Get-Content 'deps/_shas.txt' | Where-Object { $_ -match '\S+\s+[0-9a-f]+' }
+        $keypart = ($pairs | Sort-Object | ForEach-Object {
+            $s = $_.Trim().Split(" ")
+            "$($s[0])@$($s[1])"
+        }) -join ';'
+
+        # Hash the joined pairs to stay within GitHub's 512-char key limit.
+        $bytes   = [System.Text.Encoding]::UTF8.GetBytes($keypart)
+        $hash    = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+        $keypart = ($hash | ForEach-Object { $_.ToString('x2') }) -join ''
+        "keypart=$keypart" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+    # Exact-key only, deliberately no restore-keys: an entry exists only if
+    # this exact dep set built successfully from a clean Assemblies dir
+    # under this SDK, so an exact hit soundly skips the build. A prefix
+    # fallback would seed Assemblies with another dep set's DLLs, which
+    # masks missing dependencies.txt entries and poisons saved entries
+    # (it saves no time either: a prefix hit still rebuilds every declared
+    # dep). Skipped when keypart is empty (no deps to build).
+    #
+    # ProgramData\BHoM\Upgrades is cached alongside Assemblies: a hit skips
+    # the build, so BHoMUpgrades' PostBuildEvent never fires and the upgrade
+    # definitions would otherwise be absent (Versioning_Engine throws
+    # DirectoryNotFoundException when the converter path is reached).
+    # NB the path list is part of the actions/cache version, so adding
+    # Upgrades made every pre-existing depsasm entry unmatchable; the first
+    # run per dep set after this change cold-builds and re-saves.
+    - name: Restore assembly cache
+      id: cache
+      if: steps.shas.outputs.keypart != ''
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          C:\ProgramData\BHoM\Assemblies
+          C:\ProgramData\BHoM\Upgrades
+        key: depsasm-${{ runner.os }}-${{ inputs.configuration }}-${{ steps.sdk.outputs.version }}-${{ steps.shas.outputs.keypart }}
+
+    - name: Build dependencies
+      if: steps.shas.outputs.keypart != '' && steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Build-Dependencies.ps1"
+        & $script -Configuration "${{ inputs.configuration }}" -CloneRoot "C:\bhom-deps"
+
+    - name: Save assembly cache
+      if: steps.shas.outputs.keypart != '' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          C:\ProgramData\BHoM\Assemblies
+          C:\ProgramData\BHoM\Upgrades
+        key: depsasm-${{ runner.os }}-${{ inputs.configuration }}-${{ steps.sdk.outputs.version }}-${{ steps.shas.outputs.keypart }}
+
+    - name: Save NuGet cache
+      if: steps.nuget-cache.outputs.cache-hit != 'true'
+      continue-on-error: true  # parallel jobs race on the same key; first writer wins, others fail benignly
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.nuget/packages
+          ~\AppData\Local\Microsoft\MSBuild\Cache
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj','**/nuget.config') }}
+
+    - name: Link dependency clones into workspace parent
+      shell: pwsh
+      run: |
+        # Junctions D:\a\<Repo>\<DepName> -> C:\bhom-deps\<DepName> so relative
+        # HintPaths in .csproj files (e.g. ..\..\Revit_UI\libs\...) resolve
+        # when building the caller. No-op for repos without such paths.
+        $workspaceParent = Split-Path $env:GITHUB_WORKSPACE
+        foreach ($dep in Get-ChildItem "C:\bhom-deps" -Directory -ErrorAction SilentlyContinue) {
+            $link = Join-Path $workspaceParent $dep.Name
+            if (-not (Test-Path $link)) {
+                cmd /c mklink /J "$link" "$($dep.FullName)" | Out-Null
+                Write-Host "::debug::Linked $($dep.Name) into workspace parent"
+            }
+        }

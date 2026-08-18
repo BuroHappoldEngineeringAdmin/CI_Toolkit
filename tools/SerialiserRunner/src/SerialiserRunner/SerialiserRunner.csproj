@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net8.0-windows, not net8.0. See HostDependencyTests: BHoM oM assemblies reference
+         WPF and WinForms, and on a plain net8.0 host those references resolve to nothing,
+         which makes GetTypes() throw and silently costs the whole assembly's registration. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SerialiserRunner</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="SerialiserRunner.Tests" />
+    <!-- UseWPF/UseWindowsForms swap the implicit-usings set and System.IO is not in the
+         replacement, so Path/File/Directory stop resolving. Restored here rather than by adding
+         usings across the source, since the cause is the TFM change and belongs next to it. -->
+    <Using Include="System.IO" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Not referenced by any code here. BHoM's serialiser dispatches via `dynamic` over a
+         Serialise(Bitmap, ...) overload, so the runtime binder must be able to load
+         System.Drawing.Bitmap or it cannot bind at all. The BHoM assemblies folder carries only a
+         type-forwarding facade, which resolves to nothing on net8.0. See HostDependencyTests. -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+  </ItemGroup>
+</Project>

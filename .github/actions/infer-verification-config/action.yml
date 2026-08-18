@@ -1,0 +1,39 @@
+name: Infer Verification.sln build configuration
+description: >
+  Inspects a Verification.sln and emits the configuration name to build
+  with. BHoM repos sometimes ship a custom Release variant (e.g.
+  ReleaseFooBar) instead of plain Release; this action picks the right
+  one so each workflow does not duplicate the inference logic. Used by
+  ci-versioning and ci-serialisation (branch and baseline passes).
+
+inputs:
+  sln_path:
+    description: Absolute path to the Verification.sln file.
+    required: true
+
+outputs:
+  config:
+    description: Configuration name suitable for `dotnet build -c <config>`.
+    value: ${{ steps.infer.outputs.config }}
+
+runs:
+  using: composite
+  steps:
+    - name: Infer configuration
+      id: infer
+      shell: pwsh
+      env:
+        SLN_PATH: ${{ inputs.sln_path }}
+      run: |
+        $slnPath = $env:SLN_PATH
+        if (-not (Test-Path $slnPath)) {
+          Write-Host "::error title=Verification.sln::File not found: $slnPath"
+          exit 1
+        }
+        $slnContent = Get-Content $slnPath -Raw
+        $verConfig = if ($slnContent -match '\bRelease\|Any CPU\b') { 'Release' } else {
+          $m = [regex]::Matches($slnContent, 'Release\w+(?=\|Any CPU)')
+          if ($m.Count -gt 0) { $m[0].Value } else { 'Release' }
+        }
+        "config=$verConfig" | Out-File $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice title=Verification.sln::Inferred build config '$verConfig'"

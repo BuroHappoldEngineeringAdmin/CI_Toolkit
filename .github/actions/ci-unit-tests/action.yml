@@ -1,0 +1,175 @@
+name: "CI Unit Tests"
+description: |
+  Discovers and runs unit tests for the caller repo, generating code coverage reports
+  and posting results to the PR.
+
+inputs:
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+  pr_number:
+    description: >
+      PR number in the caller repo. Proxy workflows pass this so the
+      coverage comment targets the right PR in cross-org contexts.
+    required: false
+    default: ""
+  test_toolkit_repo:
+    description: >
+      Test_Toolkit repository (owner/repo). Override to point at a fork.
+    required: false
+    default: "BHoM/Test_Toolkit"
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout caller repo
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 1
+
+    - name: Compute changed files
+      id: changed
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        patterns: '*.cs *.csproj *.sln *.props *.targets'
+        skip_if_not_pr: 'false'
+
+    # Convention: tests live in .ci/unit-tests/<RepoName>_Tests.sln.
+    - name: Discover test solution
+      id: test_check
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $slns = Get-ChildItem -Path ".ci/unit-tests" -Filter "*.sln" -ErrorAction SilentlyContinue
+
+        if (-not $slns) {
+          Write-Host "::warning::No test solution found under .ci/unit-tests/. Unit test step skipped."
+          "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          exit 0
+        }
+
+        if ($slns.Count -gt 1) {
+          Write-Host "::warning::Multiple solutions found under .ci/unit-tests/. Using: $($slns[0].Name)"
+        }
+        $sln = $slns[0].FullName
+        "found=true"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "solution=$sln" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice::Test solution discovered: $sln"
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.test_check.outputs.found == 'true'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    - name: Resolve dependencies
+      if: steps.test_check.outputs.found == 'true'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode:             caller
+        additional_seeds: ${{ inputs.test_toolkit_repo }}
+        dotnet_version:   '8.0'
+        configuration:    Release
+        token:            ${{ steps.dep-token.outputs.token }}
+
+    # Per-project invocation, not `dotnet test <sln>`. BHoM `_Tests.sln` files
+    # map every project's `Test|Any CPU` to `Debug|Any CPU`, so a solution-level
+    # build silently compiles Debug and the test host (which only has an
+    # executable TFM under Test) is never produced. Iterating `.csproj` files
+    # honours `--configuration Test` correctly.
+    - name: Run tests
+      id: run_tests
+      if: steps.test_check.outputs.found == 'true'
+      shell: pwsh
+      env:
+        # Tests target net6.0[-windows] but windows-2025 runners ship only
+        # .NET 8/9/10. Roll forward is mandatory, otherwise the test host
+        # fails to start. `Major` resolves to the lowest available higher
+        # major (currently .NET 8) for deterministic behaviour across image
+        # refreshes; `LatestMajor` would track the newest installed runtime.
+        DOTNET_ROLL_FORWARD: Major
+      run: |
+        $sln    = "${{ steps.test_check.outputs.solution }}"
+        $slnDir = Split-Path $sln -Parent
+        # Filter to `*Tests.csproj`. The solution also lists source projects as
+        # ProjectReferences, on which `dotnet test` would exit 0 with no output.
+        $projects = Select-String -Path $sln -Pattern '"(?<p>[^"]+Tests\.csproj)"' |
+          ForEach-Object { (Resolve-Path (Join-Path $slnDir ($_.Matches[0].Groups['p'].Value -replace '\\','/'))).Path }
+        if (-not $projects) {
+          Write-Host "::error::No *Tests.csproj files found in $sln"
+          exit 1
+        }
+        Write-Host "::notice::Discovered $($projects.Count) test project(s)"
+
+        $failed = @()
+        $zero   = @()
+        foreach ($proj in $projects) {
+          $name   = [IO.Path]::GetFileNameWithoutExtension($proj)
+          $before = (Get-ChildItem TestResults -Filter *.trx -Recurse -EA SilentlyContinue | Measure-Object).Count
+
+          Write-Host "::group::dotnet test $name"
+          dotnet test $proj -c Test --collect:"XPlat Code Coverage" --logger "trx;LogFileName=$name.trx" --results-directory TestResults
+          $exit = $LASTEXITCODE
+          Write-Host "::endgroup::"
+
+          $after = (Get-ChildItem TestResults -Filter *.trx -Recurse -EA SilentlyContinue | Measure-Object).Count
+          if ($exit -ne 0)         { $failed += $name }
+          elseif ($after -eq $before) { $zero += $name }
+        }
+
+        # A `*Tests.csproj` that exits 0 with no `.trx` indicates broken discovery
+        # (missing test framework reference, silent runner load failure). Fail
+        # here rather than report green on broken-discovery PRs.
+        if ($zero)   { Write-Host "::error title=UnitTests::No test output from project(s): $($zero -join ', ') . Likely zero tests discovered, or a runner load failure. A test project must produce at least one test result."; exit 1 }
+        if ($failed) { Write-Host "::error title=UnitTests::Test runs failed for project(s): $($failed -join ', ')"; exit 1 }
+
+    - name: Upload test results (TRX)
+      if: always() && hashFiles('TestResults/**/*.trx') != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: test-results-${{ github.run_id }}
+        path: TestResults/
+        retention-days: 7
+
+    - name: Generate code coverage report
+      id: generate_coverage
+      if: always() && hashFiles('TestResults/**/coverage.cobertura.xml') != ''
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path ".config" | Out-Null
+        Set-Content -Path ".config/dotnet-tools.json" -Value '{
+          "version": 1,
+          "isRoot": true,
+          "tools": {
+            "dotnet-reportgenerator-globaltool": {
+              "version": "5.4.4",
+              "commands": ["reportgenerator"]
+            }
+          }
+        }'
+        dotnet tool restore
+        dotnet tool run reportgenerator -- "-reports:TestResults/*/coverage.cobertura.xml" "-targetdir:CodeCoverage" "-reporttypes:MarkdownSummaryGithub;Cobertura"
+        Get-Content CodeCoverage/SummaryGithub.md | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+    - name: Add Coverage PR Comment
+      if: always() && hashFiles('CodeCoverage/SummaryGithub.md') != '' && (github.event_name == 'pull_request' || inputs.pr_number)
+      continue-on-error: true
+      uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+      with:
+        recreate: false
+        path: CodeCoverage/SummaryGithub.md
+        number: ${{ inputs.pr_number || github.event.pull_request.number }}
+        GITHUB_TOKEN: ${{ steps.dep-token.outputs.token }}

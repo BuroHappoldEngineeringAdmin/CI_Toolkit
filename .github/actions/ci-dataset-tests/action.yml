@@ -1,0 +1,218 @@
+name: "CI Dataset Tests"
+description: |
+  Discovers and runs BHoM dataset unit tests for the caller repo, validating
+  fixture integrity against the built assemblies and staging dependencies.
+
+inputs:
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+  versioning_toolkit_repo:
+    description: >
+      Versioning_Toolkit repository (owner/repo). Cloned and built as a
+      dataset-staging dependency. Override to point at a fork.
+    required: false
+    default: 'BHoM/Versioning_Toolkit'
+  test_toolkit_repo:
+    description: >
+      Test_Toolkit repository (owner/repo). Override to point at a fork.
+    required: false
+    default: 'BHoM/Test_Toolkit'
+  additional_dataset_repos:
+    description: >
+      Newline-separated list of repositories (owner/repo) to clone and
+      build before tests run, used to stage supplementary dataset fixtures
+      alongside the primary toolkits.
+    required: false
+    default: ''
+  deps_dotnet_version:
+    description: >
+      .NET SDK version for building the caller's dep graph.
+    required: false
+    default: '8.0'
+  runner_dotnet_version:
+    description: >
+      .NET SDK version for publishing DatasetTestRunner.
+    required: false
+    default: '10.x'
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout caller repo
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 1
+
+    # Two-pass change detection. A source change can affect any test, so we
+    # run all dataset fixtures. A dataset-only change runs just the touched
+    # fixtures.
+    - name: Compute changed source files
+      id: changed-cs
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        patterns: '*.cs *.csproj *.sln *.props *.targets'
+        skip_if_not_pr: 'false'
+
+    # Anchored to .ci/Datasets/ because that is where fixtures live, and because
+    # the all-fixtures branch below enumerates exactly that directory. An
+    # unanchored ':(icase)*datasets*.json' matched any path containing
+    # "datasets", so a changed Datasets/foo.json at the repo root was executed
+    # as a fixture by this branch while the all-fixtures branch would never
+    # find it: the two branches of one check disagreed about what a fixture is.
+    # Note the unanchored form is correct for ci-compliance check_type: dataset,
+    # which deliberately validates any dataset JSON anywhere in the repo; the
+    # pattern was reused here where the intent differs.
+    # '*' matches '/' in git pathspecs, so a single '*' spans nested directories.
+    - name: Compute changed dataset files
+      id: changed-datasets
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        patterns: ':(icase).ci/Datasets/*.json'
+        output_file: changed_datasets.txt
+        skip_if_not_pr: 'false'
+
+    # Populate test_files.txt with the fixtures to run and emit count.
+    # Always runs so the output is always set: a skipped step's empty output
+    # would compare unequal to '0' under GitHub's expression semantics, so
+    # downstream `if:` guards on count would behave inversely to intent.
+    - name: Resolve test scope
+      id: scope
+      shell: pwsh
+      run: |
+        $csCount      = [int]"${{ steps.changed-cs.outputs.count }}"
+        $datasetCount = [int]"${{ steps.changed-datasets.outputs.count }}"
+
+        if ($csCount -eq 0 -and $datasetCount -eq 0) {
+          Write-Host "::notice::No relevant files changed. Dataset tests skipped."
+          "count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          return
+        }
+
+        if ($csCount -gt 0) {
+          # Source changed: run every dataset fixture.
+          $files = Get-ChildItem -Path ".ci/Datasets" -Recurse -Filter "*.json" -ErrorAction SilentlyContinue
+          if (-not $files) {
+            Write-Host "::notice::No .ci/Datasets files found. Dataset tests skipped."
+            "count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $files.FullName | Set-Content test_files.txt
+            "count=$($files.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "::notice::Source files changed. Running all $($files.Count) dataset fixture(s)."
+          }
+        } else {
+          # Only dataset .json files changed: run just those.
+          if (-not (Test-Path changed_datasets.txt)) {
+            "count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            # Resolve to absolute paths so annotations match the all-fixtures
+            # branch and render correctly in the GitHub UI.
+            Get-Content changed_datasets.txt |
+              ForEach-Object { (Resolve-Path $_).Path } |
+              Set-Content test_files.txt
+            "count=$datasetCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "::notice::Only dataset files changed. Running $datasetCount changed fixture(s)."
+          }
+        }
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.scope.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    - name: Resolve dependencies
+      if: steps.scope.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode:             caller
+        additional_seeds: |
+          ${{ inputs.test_toolkit_repo }}
+          ${{ inputs.versioning_toolkit_repo }}
+          ${{ inputs.additional_dataset_repos }}
+        dotnet_version:   ${{ inputs.deps_dotnet_version }}
+        configuration:    Release
+        token:            ${{ steps.dep-token.outputs.token }}
+
+    # The caller solution must be built so its DLLs are staged to
+    # C:\ProgramData\BHoM\Assemblies via the repo's PostBuildEvent.
+    # CheckTest() reflects over those assemblies at fixture execution time.
+    - name: Discover primary solution
+      id: solution
+      if: steps.scope.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/discover-solution@develop
+      with:
+        check_title: DatasetTests
+
+    - name: Build caller solution
+      if: steps.scope.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $slnPath = "${{ steps.solution.outputs.path }}"
+
+        Write-Host "::group::dotnet restore"
+        dotnet restore $slnPath
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Write-Host "::endgroup::"
+
+        Write-Host "::group::dotnet build Release"
+        dotnet build $slnPath --no-restore --configuration Release --nologo -m
+        $buildExit = $LASTEXITCODE
+        Write-Host "::endgroup::"
+
+        if ($buildExit -ne 0) {
+          Write-Host "::error title=DatasetTests::Caller solution build failed. Test results would be unreliable."
+          exit $buildExit
+        }
+
+    - name: Prepare runner
+      if: steps.scope.outputs.count != '0'
+      id: runner
+      uses: BHoM/CI_Toolkit/.github/actions/prepare-runner@develop
+      with:
+        runner_project: tools/ComplianceRunner/src/DatasetTestRunner/DatasetTestRunner.csproj
+        output_dir:     out\runner
+        configuration:  Release
+        cache_prefix:   dataset-test-runner
+        dotnet_version: ${{ inputs.runner_dotnet_version }}
+
+    - name: Run dataset unit tests
+      id: run_tests
+      if: steps.scope.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $runnerExe = "${{ steps.runner.outputs.runner_exe }}"
+        $fileList  = @(Get-Content test_files.txt)
+
+        if ($fileList.Count -eq 0) {
+          Write-Host "::warning::test_files.txt is empty. No files to test."
+          exit 0
+        }
+
+        Write-Host "::group::BHoM dataset unit tests"
+        & $runnerExe --output github @fileList
+        $exitCode = $LASTEXITCODE
+        Write-Host "::endgroup::"
+
+        if ($env:GITHUB_STEP_SUMMARY) {
+          $status = if ($exitCode -eq 0) { "passed" } else { "**failed**" }
+          @(
+            "### Dataset unit tests $status"
+            ""
+            "Fixtures executed: $($fileList.Count)."
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        }
+
+        exit $exitCode

@@ -1,0 +1,348 @@
+name: "CI Serialisation"
+description: |
+  Validates BHoM serialisation compliance by comparing branch and baseline
+  serialisation test results. Runs branch tests immediately; if failures are
+  detected, checks out the base branch and compares results to determine if
+  failures are regressions or pre-existing.
+
+inputs:
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+  base_ref:
+    description: >
+      PR base branch. `github.base_ref` is not exposed inside the reusable
+      workflow's workflow_call context, so the proxy template must forward
+      it explicitly.
+    required: false
+    default: 'develop'
+  serialisation_engine_repo:
+    description: >
+      BHoM_Engine repository (owner/repo). Must expose
+      .ci/code/Verification.sln, which builds the serialisation test
+      assemblies. Override to point at a fork.
+    required: false
+    default: 'BHoM/BHoM_Engine'
+  test_toolkit_repo:
+    description: >
+      Test_Toolkit repository (owner/repo). Override to point at a fork.
+    required: false
+    default: 'BHoM/Test_Toolkit'
+  dotnet_version:
+    description: >
+      .NET SDK version for building dependencies and publishing
+      SerialiserRunner.
+    required: false
+    default: '8.0'
+  implausible_baseline_ratio:
+    description: >
+      POLICY VALUE, NOT A MEASUREMENT. Share of the tested population that must fail
+      serialisation on the base branch before the check refuses to diff against it and
+      reports "baseline unusable" instead of naming affected types. A baseline that broken
+      cannot establish what the branch changed, so any diff against it is meaningless.
+      Set by CI ownership. Observed failure rate at time of writing: 99.3% (5981 of 6024
+      on a private Revit tool repo), so anything from roughly 0.25 to 0.90 behaves identically
+      today. Raise or lower here rather than in CompareCommand.cs.
+    required: false
+    default: '0.5'
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout PR branch
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 0
+
+    - name: Compute changed files
+      id: changed
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        # AssemblyInfo.cs is excluded to match BHoMBot's serialisation gate
+        # (Serialisation.cs:35). A version bump cannot change the verdict: the
+        # comparator keys on IToText, which carries no assembly version, and the
+        # round trip happens within a single run. .csproj stays in, unlike
+        # BHoMBot, because a project file can add a reference and so genuinely
+        # change the assembly population.
+        patterns: '*.cs *.csproj *.sln :(exclude)*AssemblyInfo.cs'
+        skip_if_not_pr: 'false'
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    # --- Branch build ---
+
+    - name: Resolve dependencies (branch)
+      id: deps_branch
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode: caller
+        dotnet_version: ${{ inputs.dotnet_version }}
+        configuration: Release
+        token: ${{ steps.dep-token.outputs.token }}
+        additional_seeds: |
+          ${{ inputs.test_toolkit_repo }}
+          ${{ inputs.serialisation_engine_repo }}
+
+    - name: Discover primary solution
+      id: solution
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/discover-solution@develop
+      with:
+        check_title: Serialisation
+
+    - name: Build primary repo (branch)
+      id: build_branch
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # -clp:ErrorsOnly, as #179 applied to dependency builds: this build is a means
+        # to an end and its compiler warnings would otherwise become annotations on a
+        # serialisation check. ci-build is where build warnings belong.
+        dotnet restore "${{ steps.solution.outputs.path }}"
+        dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m -clp:ErrorsOnly
+
+    - name: Locate Verification.sln
+      id: ver_sln
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $engParts   = "${{ inputs.serialisation_engine_repo }}".Split('/', 2)
+        $engDepsDir = "C:\bhom-deps\$($engParts[1])"
+        # Resolve order: engDepsDir first, workspace as fallback. bhom-deps
+        # takes priority to avoid picking up an unrelated .ci/code/Verification.sln
+        # in the caller (e.g. Revit repos ship one for Revit-specific tests).
+        # The workspace path only matches when BHoM_Engine itself is the caller.
+        $candidates = @(
+          (Join-Path $engDepsDir ".ci\code\Verification.sln"),
+          (Join-Path "${{ github.workspace }}" ".ci\code\Verification.sln")
+        )
+        $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $found) {
+          Write-Host "::error title=Serialisation::Verification.sln not found in $engDepsDir or workspace."
+          Write-Host "${{ inputs.serialisation_engine_repo }} must be the calling repo or a direct/transitive entry in dependencies.txt."
+          exit 1
+        }
+        "path=$found" | Out-File $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice title=Verification.sln::$found"
+
+    - name: Infer Verification.sln build configuration
+      id: ver_config
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/infer-verification-config@develop
+      with:
+        sln_path: ${{ steps.ver_sln.outputs.path }}
+
+    - name: Build Verification.sln (branch)
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        dotnet restore "${{ steps.ver_sln.outputs.path }}"
+        dotnet build "${{ steps.ver_sln.outputs.path }}" --no-restore -c ${{ steps.ver_config.outputs.config }} --nologo -clp:ErrorsOnly
+
+    - name: Prepare SerialiserRunner
+      id: runner
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/prepare-runner@develop
+      with:
+        runner_project: tools/SerialiserRunner/src/SerialiserRunner/SerialiserRunner.csproj
+        output_dir: out\serialiser-runner
+        configuration: Release
+        cache_prefix: serialiser-runner
+        source_dir: tools/SerialiserRunner/src
+        dotnet_version: ${{ inputs.dotnet_version }}
+
+    - name: Run serialisation tests (branch)
+      id: branch_run
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        & "${{ steps.runner.outputs.runner_exe }}" run `
+          --assemblies "C:\ProgramData\BHoM\Assemblies" `
+          --output branch-result.json
+
+        $result = Get-Content branch-result.json | ConvertFrom-Json
+        "status=$($result.status)" | Out-File $env:GITHUB_OUTPUT -Append
+        # Coverage evidence, carried into the job summary. branch-result.json already
+        # reports Population and LoadedAssemblies; both were being discarded, which left
+        # a green summary that could not be distinguished from a vacuous one.
+        "population=$($result.Population)"   | Out-File $env:GITHUB_OUTPUT -Append
+        "assemblies=$(@($result.LoadedAssemblies).Count)" | Out-File $env:GITHUB_OUTPUT -Append
+        "legs=$(@($result.Legs).Count)"      | Out-File $env:GITHUB_OUTPUT -Append
+        "failures=$($result.failureCount)"   | Out-File $env:GITHUB_OUTPUT -Append
+        Write-Host "Branch serialisation: $($result.status) ($($result.failureCount) failure(s)) over $($result.Population) object(s) in $(@($result.LoadedAssemblies).Count) assembl(ies)"
+
+    # --- Baseline build (only if the branch run reported errors) ---
+
+    - name: Fetch and checkout base branch
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      shell: pwsh
+      run: |
+        git fetch origin ${{ inputs.base_ref }}
+        git checkout ${{ inputs.base_ref }}
+        Remove-Item "C:\ProgramData\BHoM\Assemblies\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    - name: Resolve dependencies (baseline)
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode: caller
+        dotnet_version: ${{ inputs.dotnet_version }}
+        configuration: Release
+        token: ${{ steps.dep-token.outputs.token }}
+        additional_seeds: |
+          ${{ inputs.test_toolkit_repo }}
+          ${{ inputs.serialisation_engine_repo }}
+
+    - name: Build primary repo (baseline)
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      shell: pwsh
+      run: |
+        dotnet restore "${{ steps.solution.outputs.path }}"
+        dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m
+
+    # Re-infer against the baseline checkout: Verification.sln may declare
+    # different Release variants on branch versus base (e.g. the branch
+    # added a new one). Reusing ver_config would build the wrong config.
+    - name: Infer Verification.sln build configuration (baseline)
+      id: ver_config_baseline
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      uses: BHoM/CI_Toolkit/.github/actions/infer-verification-config@develop
+      with:
+        sln_path: ${{ steps.ver_sln.outputs.path }}
+
+    - name: Build Verification.sln (baseline)
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      shell: pwsh
+      run: |
+        dotnet restore "${{ steps.ver_sln.outputs.path }}"
+        dotnet build "${{ steps.ver_sln.outputs.path }}" --no-restore -c ${{ steps.ver_config_baseline.outputs.config }} --nologo
+
+    # --- Comparison ---
+
+    - name: Run serialisation tests (baseline)
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      shell: pwsh
+      run: |
+        & "${{ steps.runner.outputs.runner_exe }}" run `
+          --assemblies "C:\ProgramData\BHoM\Assemblies" `
+          --output baseline-result.json
+
+    - name: Compare branch vs baseline
+      id: compare
+      if: steps.changed.outputs.count != '0' && steps.branch_run.outputs.status == 'Error'
+      shell: pwsh
+      run: |
+        & "${{ steps.runner.outputs.runner_exe }}" compare `
+          --baseline baseline-result.json `
+          --branch branch-result.json `
+          --implausible-baseline-ratio "${{ inputs.implausible_baseline_ratio }}"
+        $code = $LASTEXITCODE
+        $verdict = switch ($code) { 0 { 'ok' } 2 { 'baseline-unusable' } default { 'regression' } }
+        "verdict=$verdict" | Out-File $env:GITHUB_OUTPUT -Append
+        if ($code -ne 0) { exit $code }
+
+    # Distinguish an infrastructure failure from a serialisation regression. A
+    # dependency build failure otherwise shows as a red serialisation check with no
+    # indication that serialisation never ran.
+    - name: Write to Job Summary (did not run)
+      if: always() && steps.changed.outputs.count != '0' && (steps.deps_branch.conclusion == 'failure' || steps.build_branch.conclusion == 'failure')
+      shell: pwsh
+      run: |
+        $step = if ("${{ steps.deps_branch.conclusion }}" -eq 'failure') { 'Resolve dependencies (branch)' } else { 'Build primary repo (branch)' }
+        @(
+          "### Serialisation did not run"
+          ""
+          "Failed in: $step"
+          ""
+          "The dependency closure did not build, so no serialisation comparison was made."
+          "This is not a serialisation finding. See the ci-build check on this pull request"
+          "for the same failure."
+        ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Write to Job Summary (branch passed)
+      if: always() && steps.changed.outputs.count != '0' && steps.branch_run.conclusion == 'success' && steps.branch_run.outputs.status != 'Error'
+      shell: pwsh
+      run: |
+        @(
+          "### Serialisation"
+          ""
+          "| Status |"
+          "|---|"
+          "| No serialisation failures (${{ steps.branch_run.outputs.status }}) |"
+          ""
+          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
+          ""
+                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Write to Job Summary (pre-existing failures)
+      if: always() && steps.changed.outputs.count != '0' && steps.compare.outputs.verdict == 'ok'
+      shell: pwsh
+      run: |
+        @(
+          "### Serialisation"
+          ""
+          "| Status |"
+          "|---|"
+          "| Serialisation failures detected. All are pre-existing on the base branch, so this job passes. |"
+          ""
+          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
+          ""
+                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Write to Job Summary (regression detected)
+      if: always() && steps.changed.outputs.count != '0' && steps.compare.outputs.verdict == 'regression'
+      shell: pwsh
+      run: |
+        @(
+          "### Serialisation"
+          ""
+          "| Status |"
+          "|---|"
+          "| Serialisation regression detected. Affected types are in the step log. |"
+          ""
+          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
+          ""
+                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Write to Job Summary (serialisation unverifiable)
+      if: always() && steps.changed.outputs.count != '0' && (steps.branch_run.conclusion == 'failure' || steps.compare.outputs.verdict == 'baseline-unusable')
+      shell: pwsh
+      run: |
+        @(
+          "### Serialisation"
+          ""
+          "| Status |"
+          "|---|"
+          "| Serialisation could not be verified. This is a CI runner failure, not a defect in this pull request. |"
+          ""
+          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
+          ""
+                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+    - name: Upload results
+      if: always() && steps.changed.outputs.count != '0'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: serialisation-results-${{ github.run_id }}
+        path: |
+          branch-result.json
+          baseline-result.json
+        if-no-files-found: ignore
+        retention-days: 14

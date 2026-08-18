@@ -1,0 +1,7 @@
+# Normalise all text files in the index; use platform default on checkout.
+* text=auto
+
+# CI scripts run on Linux runners — enforce LF regardless of checkout platform.
+*.sh  text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf

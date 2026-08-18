@@ -1,0 +1,163 @@
+name: "CI Build"
+description: |
+  Builds the caller repo's primary solution (Release) plus any altConfigs.txt
+  configurations, resolving the BHoM dependency graph first. Skips when no
+  build-relevant files changed.
+
+inputs:
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout caller repo
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 1
+
+    - name: Compute changed files
+      id: changed
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        # :(exclude)*AssemblyInfo.cs matches ci-versioning and ci-serialisation, and
+        # matches what BHoMBot's core check did (Checks/Core.cs:30).
+        #
+        # It is inert today, and is here for consistency rather than for effect. Two
+        # measurements, both worth recording so nobody reads this as protection against
+        # milestone version bumps:
+        #
+        #   1. AssemblyInfo.cs is nearly extinct. Zero files in BHoM_Engine,
+        #      Revit_Toolkit and one private Revit tool repo; one in BHoM_UI, and that one is a
+        #      test project under .ci/.
+        #   2. Versions moved into the project file. A BHoM-#1-Uptick9.x sweep edits
+        #      <FileVersion> in .csproj, not AssemblyInfo.cs, so it matches *.csproj here
+        #      and triggers a build regardless. BHoMBot's stated reason for the exclusion,
+        #      speeding up milestone checks, no longer holds for any check that carries it.
+        #
+        # Excluding *.csproj instead is not an option: real project changes must trigger a
+        # build. The cost of fleet-wide upticks is tracked separately.
+        patterns: '*.cs *.csproj *.sln *.props *.targets altConfigs.txt :(exclude)*AssemblyInfo.cs'
+        skip_if_not_pr: 'false'
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    - name: Resolve dependencies
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode: caller
+        dotnet_version: '8.0'
+        configuration: Release
+        token: ${{ steps.dep-token.outputs.token }}
+
+    - name: Discover primary solution
+      id: solution
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/discover-solution@develop
+      with:
+        check_title: Build
+        require_sdk_style: 'true'
+
+    # Runs regardless of altConfigs.txt presence: a repo with Release* solution
+    # configurations and no altConfigs.txt is exactly the drift case to catch.
+    - name: Check altConfigs drift
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Check-AltConfigDrift.ps1"
+        & $script -SlnPath "${{ steps.solution.outputs.path }}"
+
+    - name: Build (Release)
+      id: build_release
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $slnPath = "${{ steps.solution.outputs.path }}"
+        $config  = "Release"
+
+        Write-Host "::group::dotnet restore"
+        dotnet restore $slnPath
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Write-Host "::endgroup::"
+
+        Write-Host "::group::dotnet build $config"
+        dotnet build $slnPath --no-restore --configuration $config --nologo -m
+        Write-Host "::endgroup::"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "::error title=Build::Primary solution build failed."
+          exit $LASTEXITCODE
+        }
+
+    # No hashFiles('altConfigs.txt') guard here. It used to gate this step, and it
+    # took down a production run:
+    #   ##[error]The template is not valid. System.TimeoutException:
+    #   hashFiles('altConfigs.txt') couldn't finish within 120 seconds.
+    # An expression-level timeout fails the whole job, and the guard was redundant:
+    # Build-AltConfigs.ps1 opens with its own Test-Path and exits 0 with a notice
+    # when the file is absent. Letting the script decide moves a job-failing
+    # template expression into a two-line filesystem check.
+    - name: Build alt configurations
+      id: build_alt
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Build-AltConfigs.ps1"
+        & $script -SlnPath "${{ steps.solution.outputs.path }}" -Configuration "Release"
+
+    # ci-build had no job summary at all. It is the check most likely to fail, and on
+    # failure a developer got the log alone. Measured on a real failing run:
+    # 3,468 lines and 884 compiler warnings around one error.
+    - name: Write to Job Summary
+      if: always() && steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $sln    = "${{ steps.solution.outputs.path }}"
+        $relCon = "${{ steps.build_release.conclusion }}"
+        $altCon = "${{ steps.build_alt.conclusion }}"
+
+        # Name the step that failed. A build failure and an alt-configuration failure
+        # need different action from the developer, and the job conclusion does not
+        # distinguish them.
+        $failedStep = ''
+        if     ($relCon -eq 'failure') { $failedStep = 'Build (Release)' }
+        elseif ($altCon -eq 'failure') { $failedStep = 'Build alt configurations' }
+
+        $altCount = 0
+        if (Test-Path 'altConfigs.txt') {
+          $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Select-AltConfigs.ps1"
+          if (Test-Path $script) {
+            . $script
+            $altCount = @(Select-AltConfigs -Lines (Get-Content 'altConfigs.txt') -Configuration 'Release').Count
+          }
+        }
+
+        $head = if ($failedStep) { "Build failed" } else { "Build passed" }
+        $md = @("### $head", "")
+        $md += "Solution: ``$sln``"
+        $md += "Configuration: Release" + $(if ($altCount -gt 0) { ", plus $altCount alt configuration(s) from altConfigs.txt" } else { "" })
+        if ($failedStep) {
+          $md += ""
+          $md += "Failed in: $failedStep"
+          $md += ""
+          $md += "Compiler errors are annotated on the changed files. Warnings are in the step log and are not listed here."
+        }
+        $md | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

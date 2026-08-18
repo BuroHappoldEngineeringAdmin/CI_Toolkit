@@ -1,0 +1,100 @@
+# Static analysis for the workflow YAML this repo distributes. CI_Toolkit is
+# the single source of CI truth (reusable workflows, composite inputs, and the
+# templates/ tier bundles copied into proxy repos), so a syntax or expression
+# error here ships to every consuming repo. actionlint also runs shellcheck
+# over embedded run: blocks on this runner.
+name: Lint Workflows
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/scripts/**'
+      - 'templates/**'
+  workflow_dispatch:
+
+concurrency:
+  group: lint-workflows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+
+      # templates/ are workflow files too (tier-bundle proxies distributed to
+      # per-org proxy repos), so they are linted alongside .github/workflows.
+      # SC2129 excluded: repeated appends to $GITHUB_OUTPUT/$GITHUB_STEP_SUMMARY
+      # are the idiomatic Actions pattern; grouping them buys nothing here.
+      - name: Lint workflow files
+        env:
+          SHELLCHECK_OPTS: --exclude=SC2129
+        run: |
+          find .github/workflows templates -name '*.yml' -print0 | xargs -0 ./actionlint -color
+
+  # The 'patterns:' inputs are git pathspecs, not globs, so a token can silently
+  # select nothing (a bare token anchors to the repo root; '**/' requires a
+  # leading directory). Both mistakes shipped as live defects, and a check that
+  # selects no files passes without examining anything. This asserts the shipped
+  # patterns against a real `git diff -- <pathspec>`.
+  changed-file-patterns:
+    name: changed-file patterns
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Assert pathspec behaviour
+        run: bash .github/scripts/tests/test-changed-file-patterns.sh
+
+  powershell-tests:
+    name: PowerShell script tests
+    # Here rather than in test-tools.yml. That workflow's paths filter is `tools/**`
+    # only, so a pull request touching .github/actions/**/*.ps1 would never trigger it,
+    # which is the same inert-check problem test-tools.yml was itself created to fix.
+    # This workflow already filters on .github/actions and .github/scripts, and already
+    # runs the bash pathspec suite, so the PowerShell suite belongs beside its sibling.
+    #
+    # windows-latest because the scripts under test are Windows-only in production
+    # (ProgramData paths, pwsh call sites in the composite actions).
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          # windows-latest ships Pester 3.4 in the box, which cannot parse Pester 5
+          # syntax. Pin the major so a Pester 6 release cannot silently change
+          # behaviour under us.
+          if (-not (Get-Module -ListAvailable Pester |
+                    Where-Object { $_.Version.Major -eq 5 })) {
+            Install-Module Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99 `
+              -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Run Pester suite
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99
+          $result = Invoke-Pester -Path .github/scripts/tests -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) {
+            Write-Host "::error title=PowerShell tests::$($result.FailedCount) test(s) failed."
+            exit 1
+          }
+          Write-Host "::notice title=PowerShell tests::$($result.PassedCount) test(s) passed."

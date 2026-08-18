@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Shared\Compliance.Shared\Compliance.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Explicit NuGet references for transitive runtime dependencies of BHoM assemblies
+      loaded via HintPath. NuGet cannot infer these from file references, so they must
+      be declared here to be included in the dotnet publish output.
+      System.Drawing.Common is required by Serialiser_Engine at runtime.
+    -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- BHoM_Engine is referenced directly here because DatasetComplianceRunner.cs -->
+    <!-- calls BH.Engine.Base.Query.DocumentationURL to supply toolUri to SarifBuilder. -->
+    <!-- The remaining assemblies are needed directly by DatasetComplianceRunner.cs  -->
+    <!-- for IsValidDataset (CodeComplianceTest_Engine) and its runtime dependencies  -->
+    <!-- (Data_oM, Serialiser_Engine) which must be present in the publish output.   -->
+    <Reference Include="BHoM">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\BHoM.dll</HintPath>
+    </Reference>
+    <Reference Include="BHoM_Engine">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\BHoM_Engine.dll</HintPath>
+    </Reference>
+    <Reference Include="CodeComplianceTest_Engine">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\CodeComplianceTest_Engine.dll</HintPath>
+      <Private>true</Private>
+      <SpecificVersion>false</SpecificVersion>
+    </Reference>
+    <Reference Include="CodeComplianceTest_oM">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\CodeComplianceTest_oM.dll</HintPath>
+    </Reference>
+    <Reference Include="Data_oM">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\Data_oM.dll</HintPath>
+    </Reference>
+    <Reference Include="Serialiser_Engine">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\Serialiser_Engine.dll</HintPath>
+    </Reference>
+    <Reference Include="Test_Engine">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\Test_Engine.dll</HintPath>
+    </Reference>
+    <Reference Include="Test_oM">
+      <HintPath>$(ProgramData)\BHoM\Assemblies\Test_oM.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

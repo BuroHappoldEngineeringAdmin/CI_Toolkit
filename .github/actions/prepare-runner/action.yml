@@ -1,0 +1,195 @@
+name: "Prepare BHoM Runner"
+description: |
+  Restores or builds a runner binary (ComplianceRunner, DatasetComplianceRunner,
+  VersioningRunner, SerialiserRunner) with SHA-keyed caching, and returns the
+  path to the published executable.
+
+  Source resolution: when `runner_source_repo` is set, that repo is checked out
+  and used as the source root. When empty, the source is expected to be
+  co-located in this repo, three levels above github.action_path.
+
+inputs:
+  runner_project:
+    description: |
+      Path within the runner source repo to the runner .csproj.
+      Example: tools/ComplianceRunner/src/ComplianceRunner/ComplianceRunner.csproj
+    required: true
+
+  output_dir:
+    description: Output directory for the published binary (e.g. out\runner).
+    required: true
+
+  configuration:
+    description: Build configuration (Release/Debug).
+    required: false
+    default: "Release"
+
+  cache_prefix:
+    description: |
+      Unique prefix for the cache key per runner type, to avoid key collisions
+      when multiple runners are prepared in the same job (e.g. compliance-runner,
+      dataset-runner).
+    required: false
+    default: "runner"
+
+  dotnet_version:
+    description: |
+      .NET SDK version used to publish the runner. Must be >= the runner
+      project's TargetFramework. Default 10.x matches ComplianceRunner
+      (Roslyn 5.0 requires net10.0).
+    required: false
+    default: "10.x"
+
+  runner_source_repo:
+    description: |
+      Repository (owner/repo) hosting the runner source tree. When set, the
+      repo is checked out and used as the source root. When empty, the
+      source is resolved from github.action_path, i.e. expected to be
+      co-located in this repository. The cache key derives from a content
+      hash of `source_dir` in the co-located case.
+    required: false
+    default: ""
+
+  runner_source_ref:
+    description: Ref to check out for runner_source_repo. Only used when runner_source_repo is set.
+    required: false
+    default: "develop"
+
+  source_dir:
+    description: |
+      Directory (relative to source root) whose contents are hashed to bust
+      the runner cache when github.action_sha is unavailable (action
+      referenced by branch name rather than a pinned SHA). Use a unique
+      path per runner type to avoid cache collisions.
+    required: false
+    default: "tools/ComplianceRunner/src"
+
+  token:
+    description: Token for checking out runner_source_repo when it is private.
+    required: false
+    default: ""
+
+outputs:
+  runner_exe:
+    description: Absolute path to the published runner executable.
+    value: ${{ steps.exe-path.outputs.path }}
+
+runs:
+  using: "composite"
+
+  steps:
+    # Self-contained: callers do not need to set up dotnet first.
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+      with:
+        dotnet-version: ${{ inputs.dotnet_version }}
+
+    # Only fires when the runner source lives in a separate repo.
+    - name: Check out runner source
+      if: inputs.runner_source_repo != ''
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        repository: ${{ inputs.runner_source_repo }}
+        ref: ${{ inputs.runner_source_ref }}
+        token: ${{ inputs.token || github.token }}
+        path: _runner_source
+
+    # Resolve the source root and the SHA used in the cache key.
+    #   runner_source_repo set:  root = _runner_source, SHA from git.
+    #   runner_source_repo empty: root is three levels above github.action_path.
+    # For the co-located case, prefer github.action_sha (populated when the
+    # action is pinned to a commit). When the action is referenced by a
+    # branch name (e.g. @develop), GitHub does not set action_sha, so fall
+    # back to a content hash of the runner source tree.
+    - name: Resolve runner source root and SHA
+      id: source
+      shell: pwsh
+      run: |
+        if ("${{ inputs.runner_source_repo }}" -ne "") {
+          $root = (Resolve-Path "_runner_source").Path
+          Push-Location $root
+          $sha = (git rev-parse HEAD).Trim()
+          Pop-Location
+        } else {
+          $root = (Resolve-Path "${{ github.action_path }}/../../..").Path
+          $sha  = "${{ github.action_sha }}"
+
+          if ([string]::IsNullOrEmpty($sha)) {
+            # Hash the runner source tree so the cache busts exactly when
+            # the source changes.
+            $srcDir  = Join-Path $root "${{ inputs.source_dir }}"
+            $content = (Get-ChildItem $srcDir -Recurse -File |
+                        Sort-Object FullName |
+                        ForEach-Object { Get-FileHash $_.FullName -Algorithm SHA256 } |
+                        Select-Object -ExpandProperty Hash) -join ''
+            $bytes   = [System.Text.Encoding]::UTF8.GetBytes($content)
+            $sha     = [System.BitConverter]::ToString(
+                           [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+                       ).Replace("-", "").ToLower()
+          }
+        }
+
+        # Resolve the SDK that will publish the runner and fold it into the cache
+        # key. `dotnet publish` output can differ across SDK versions, so a binary
+        # cached under one SDK is only valid for that SDK; without this a floating
+        # `dotnet_version` (e.g. 10.x) reuses a stale binary after a runner-image
+        # SDK bump. Resolved from $root so any global.json there governs, matching
+        # what the publish step below selects. The version is stable per runner
+        # image, so this busts the cache only on a genuine SDK change, not per run.
+        Push-Location $root
+        $sdk = (dotnet --version).Trim()
+        Pop-Location
+
+        "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "sha=$sha"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "sdk=$sdk"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "Runner source: $root @ $($sha.Substring(0, [Math]::Min(7, $sha.Length))) (SDK $sdk)"
+
+    # Split restore + save: post-step auto-save does not fire inside
+    # cross-repo composite actions, so the save is an explicit step below.
+    - name: Restore runner cache
+      id: cache
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ inputs.output_dir }}
+        key: ${{ inputs.cache_prefix }}-${{ runner.os }}-${{ steps.source.outputs.sha }}-sdk${{ steps.source.outputs.sdk }}-${{ inputs.configuration }}-${{ inputs.output_dir }}
+
+    - name: Publish runner (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $repoRoot = "${{ steps.source.outputs.root }}"
+        $proj = Join-Path $repoRoot "${{ inputs.runner_project }}"
+        if (-not (Test-Path $proj)) {
+          Write-Error "Runner project not found at: $proj"
+          exit 1
+        }
+        dotnet publish $proj -c ${{ inputs.configuration }} -o "${{ inputs.output_dir }}"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "dotnet publish failed for $proj"
+          exit $LASTEXITCODE
+        }
+
+    - name: Save runner cache
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ inputs.output_dir }}
+        key: ${{ inputs.cache_prefix }}-${{ runner.os }}-${{ steps.source.outputs.sha }}-sdk${{ steps.source.outputs.sdk }}-${{ inputs.configuration }}-${{ inputs.output_dir }}
+
+    - name: Resolve runner exe path
+      id: exe-path
+      shell: pwsh
+      run: |
+        $projName = [IO.Path]::GetFileNameWithoutExtension("${{ inputs.runner_project }}")
+        $ext      = if ($IsWindows) { '.exe' } else { '' }
+        $exePath  = Join-Path "${{ inputs.output_dir }}" "$projName$ext"
+        "path=$exePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "Runner exe: $exePath"
+        if (-not (Test-Path $exePath)) {
+          Write-Host "Contents of ${{ inputs.output_dir }}:"
+          Get-ChildItem "${{ inputs.output_dir }}" -ErrorAction SilentlyContinue |
+            Select-Object FullName
+          Write-Error "Runner executable not found at expected path: $exePath"
+          exit 1
+        }

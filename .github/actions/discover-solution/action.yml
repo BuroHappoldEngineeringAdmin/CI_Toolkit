@@ -1,0 +1,70 @@
+name: Discover primary solution
+description: >
+  Locates the caller repo's primary .sln file. Prefers `<RepoName>.sln` at
+  the workspace root and falls back to the first alphabetical .sln when
+  the conventional name is absent. Optionally rejects legacy non-SDK
+  projects. Used by ci-build, ci-versioning, ci-serialisation, and
+  ci-dataset-tests.
+
+inputs:
+  check_title:
+    description: >
+      Annotation title used in ::error and ::notice messages
+      (e.g. Build, Versioning, Serialisation, DatasetTests).
+    required: true
+  require_sdk_style:
+    description: >
+      When 'true', enumerate the discovered solution's projects and fail
+      if any .csproj lacks an Sdk attribute. ci-build enables this to
+      reject legacy MSBuild projects that BHoMBot tolerated.
+    required: false
+    default: 'false'
+
+outputs:
+  path:
+    description: Absolute path of the discovered .sln.
+    value: ${{ steps.discover.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Discover primary solution
+      id: discover
+      shell: pwsh
+      env:
+        REPO_NAME: ${{ github.event.repository.name }}
+        CHECK_TITLE: ${{ inputs.check_title }}
+        REQUIRE_SDK_STYLE: ${{ inputs.require_sdk_style }}
+      run: |
+        $repoName = $env:REPO_NAME
+        $title    = $env:CHECK_TITLE
+
+        $sln = Get-ChildItem -Path (Get-Location) -Filter "$repoName.sln" -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if (-not $sln) {
+          $sln = Get-ChildItem -Path (Get-Location) -Filter '*.sln' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        }
+        if (-not $sln) {
+          Write-Host "::error title=$title::No .sln file found in repository '$repoName'."
+          exit 1
+        }
+        $slnPath = $sln.FullName
+
+        if ($env:REQUIRE_SDK_STYLE -eq 'true') {
+          $legacyProjects = @(dotnet sln $slnPath list 2>$null |
+            Where-Object { $_ -match '\.csproj$' } |
+            ForEach-Object { Join-Path (Split-Path $slnPath) $_ } |
+            Where-Object { Test-Path $_ } |
+            Where-Object {
+              $content = Get-Content $_ -Raw -ErrorAction SilentlyContinue
+              $content -and $content -notmatch '<Project[^>]+Sdk=' -and $content -notmatch '<Sdk\s'
+            })
+          if ($legacyProjects.Count -gt 0) {
+            Write-Host "::error title=$title::Non-SDK project(s) detected, legacy MSBuild is not supported. Migrate to <Project Sdk=`"Microsoft.NET.Sdk`">."
+            exit 1
+          }
+        }
+
+        "path=$slnPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice title=${title}::Solution: $slnPath"

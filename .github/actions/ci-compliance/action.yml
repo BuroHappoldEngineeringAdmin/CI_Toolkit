@@ -1,0 +1,148 @@
+name: "CI Compliance"
+description: |
+  Runs one BHoM compliance check (code | copyright | documentation | project
+  | dataset) over the changed files, building the Test_Toolkit dependency
+  graph and the matching compliance runner first. Skips when no relevant
+  files changed.
+
+inputs:
+  check_type:
+    description: "Compliance check to run: code | copyright | documentation | project | dataset"
+    required: true
+  patterns:
+    description: Space-separated git pathspecs for files relevant to this check type.
+    required: true
+  test_toolkit_repo:
+    description: Test_Toolkit repository (owner/repo). Override to point at a fork.
+    required: false
+    default: 'BHoM/Test_Toolkit'
+  deps_dotnet_version:
+    description: .NET SDK version that builds the Test_Toolkit dep graph (net8.0).
+    required: false
+    default: '8.0'
+  runner_dotnet_version:
+    description: .NET SDK version that publishes the compliance runner (net10.0).
+    required: false
+    default: '10.x'
+  app_id:
+    description: GitHub App client ID for cross-org token minting.
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App PEM private key.
+    required: false
+    default: ""
+  fallback_token:
+    description: Fallback token when App credentials are absent.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout caller repo
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 1
+
+    - name: Compute changed files
+      id: changed
+      uses: BHoM/CI_Toolkit/.github/actions/compute-changed-files@develop
+      with:
+        patterns: ${{ inputs.patterns }}
+        output_file: changed_files.txt
+
+    - name: Mint dependency token
+      id: dep-token
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/mint-dep-token@develop
+      with:
+        app_id:         ${{ inputs.app_id }}
+        private_key:    ${{ inputs.private_key }}
+        fallback_token: ${{ inputs.fallback_token || github.token }}
+
+    - name: Resolve dependencies (Test_Toolkit graph)
+      if: steps.changed.outputs.count != '0'
+      uses: BHoM/CI_Toolkit/.github/actions/resolve-dependencies@develop
+      with:
+        mode:           seeds
+        seeds:          ${{ inputs.test_toolkit_repo }}
+        dotnet_version: ${{ inputs.deps_dotnet_version }}
+        configuration:  Release
+        token:          ${{ steps.dep-token.outputs.token }}
+
+    - name: Resolve runner project
+      id: runner-project
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      run: |
+        if [ "${{ inputs.check_type }}" = "dataset" ]; then
+          echo "path=tools/ComplianceRunner/src/DatasetComplianceRunner/DatasetComplianceRunner.csproj" >> "$GITHUB_OUTPUT"
+          echo "cache_prefix=dataset-runner" >> "$GITHUB_OUTPUT"
+        else
+          echo "path=tools/ComplianceRunner/src/ComplianceRunner/ComplianceRunner.csproj" >> "$GITHUB_OUTPUT"
+          echo "cache_prefix=compliance-runner" >> "$GITHUB_OUTPUT"
+        fi
+
+    # CodeComplianceTest_Engine.dll (from Test_Toolkit) is bundled into the
+    # ComplianceRunner output via Private=true. The runner cache key must
+    # therefore include Test_Toolkit's SHA; otherwise StartOfMilestoneCommand
+    # version bumps are silently ignored until the cache expires.
+    - name: Read Test_Toolkit SHA for cache key
+      id: tt-sha
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      run: |
+        sha=""
+        if [ -f "deps/_shas.txt" ]; then
+          sha=$(grep '^${{ inputs.test_toolkit_repo }} ' deps/_shas.txt | awk '{print $2}' || true)
+        fi
+        echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+    - name: Prepare runner
+      if: steps.changed.outputs.count != '0'
+      id: runner
+      uses: BHoM/CI_Toolkit/.github/actions/prepare-runner@develop
+      with:
+        runner_project: ${{ steps.runner-project.outputs.path }}
+        output_dir:     out\runner
+        configuration:  Release
+        cache_prefix:   ${{ steps.runner-project.outputs.cache_prefix }}-tt${{ steps.tt-sha.outputs.sha }}
+        dotnet_version: ${{ inputs.runner_dotnet_version }}  # both runners target net10.0
+
+    - name: Run ${{ inputs.check_type }} compliance
+      id: run_check
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $runnerExe = "${{ steps.runner.outputs.runner_exe }}"
+        $orgUrl    = "${{ github.server_url }}/${{ github.repository }}"
+        $fileList  = @(Get-Content changed_files.txt)
+        $check     = "${{ inputs.check_type }}"
+
+        if ($fileList.Count -eq 0) {
+          Write-Host "::warning::changed_files.txt is empty. No files to check."
+          exit 0
+        }
+
+        Write-Host "::group::BHoM $check compliance"
+
+        # DatasetComplianceRunner has a different CLI shape: no check-type
+        # argument, no --org-url, and all positional args are treated as file
+        # paths. Branch the invocation accordingly.
+        if ($check -eq "dataset") {
+          & $runnerExe --output github @fileList
+        } else {
+          & $runnerExe $check --output github --org-url "$orgUrl" @fileList
+        }
+        $exitCode = $LASTEXITCODE
+        Write-Host "::endgroup::"
+
+        if ($env:GITHUB_STEP_SUMMARY) {
+          $status = if ($exitCode -eq 0) { "passed" } else { "**failed**" }
+          @(
+            "### $check compliance $status"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        }
+
+        exit $exitCode
