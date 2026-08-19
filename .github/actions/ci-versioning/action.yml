@@ -163,6 +163,54 @@ runs:
         dotnet restore "${{ steps.solution.outputs.path }}"
         dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m -clp:ErrorsOnly
 
+        # Build the repo's own Release* alternate configurations as well.
+        #
+        # The versioning datasets record the assembly that declared each method, and on Revit
+        # repos that is a year-suffixed assembly per configuration: Revit_Core_Engine_2022
+        # through _2026. A Release-only build produces one of them, so every dataset entry
+        # naming another cannot be evaluated at all. BHoMBot does not have this problem
+        # because CloneInstaller.cs:23 runs BuildConfigs over the installer's altConfigs.txt
+        # before versioning, so its ProgramData carries every configuration.
+        #
+        # Measured on a sandbox Revit_Toolkit, windows-2025-vs2026, n=3: the first
+        # configuration takes 47-59s and carries the whole warm-up, each additional one takes
+        # 4-8s (median 5), and Build\ grows 1.2 MB per configuration. Total 76s against a 47s
+        # Release-only baseline, so 1.6x rather than the 5x a per-config estimate suggests.
+        #
+        # Debug* entries are skipped: only Release* ships, matching the installer. On
+        # Revit_Toolkit, Release2022 duplicates plain Release (same REVIT2022 constant, same
+        # assembly name). It is left in rather than special-cased, because detecting that
+        # requires reading DefineConstants and the saving is six seconds.
+        $altFile = Join-Path "${{ github.workspace }}" 'altConfigs.txt'
+        if (Test-Path $altFile) {
+          $repo = "${{ github.repository }}"
+          $configs = Get-Content $altFile |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ } |
+            ForEach-Object {
+              # Lines are 'org/repo/ConfigName'. Some files list other repos, and building
+              # those here would apply their configuration name to this source tree.
+              $parts = $_.Split('/')
+              if ($parts.Count -ge 3 -and "$($parts[0])/$($parts[1])" -eq $repo) { $parts[2] }
+            } |
+            Where-Object { $_ -like 'Release*' } |
+            Select-Object -Unique
+
+          if ($configs) {
+            Write-Host "::notice title=Versioning::Building $($configs.Count) alternate configuration(s): $($configs -join ', ')."
+            foreach ($c in $configs) {
+              dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c $c --nologo -m -clp:ErrorsOnly
+              if ($LASTEXITCODE -ne 0) {
+                # Loud, not soft. A configuration that will not compile is a build problem, and
+                # continuing silently would put us back to judging methods whose declaring
+                # assembly was never produced, which is the defect this exists to remove.
+                Write-Host "::error title=Versioning::Configuration '$c' failed to build."
+                exit 1
+              }
+            }
+          }
+        }
+
     # There is deliberately no build-completeness fast-fail here any more.
     #
     # A "Fast-fail on missing versioning-critical DLLs" step used to download
