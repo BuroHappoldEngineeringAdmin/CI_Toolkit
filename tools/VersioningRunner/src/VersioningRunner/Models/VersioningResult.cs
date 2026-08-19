@@ -38,7 +38,25 @@ public enum ClassificationPath
     SignatureBlockerInsideBHoM,
     // No probe was supplied by the caller, which happens only in unit tests.
     ProbeNotSupplied,
+    // The dataset record names a declaring assembly that is not in this
+    // closure, and the type was resolved from a different assembly instead. The entry
+    // describes another repository's code, so no verdict on it is available here.
+    ForeignDeclaringAssembly,
+    // As above, but the absent assembly is a build-configuration variant of
+    // one the subject did build (Revit_Core_Engine_2024 against a Release/2022 build), so
+    // the code exists in the repo and simply was not compiled in this run.
+    ConfigurationNotBuilt,
 }
+
+// What this run actually built, needed to tell "the recorded declaring
+// assembly is missing because it is someone else's" from "because we did not compile that
+// configuration" from "because it was genuinely removed". Passed explicitly rather than
+// held in static state: the runner is a single-shot process but the tests are not, and
+// static state cannot be arranged per-case.
+public sealed record ClosureContext(
+    IReadOnlySet<string> LoadedNames,
+    IReadOnlySet<string> LoadedBaseNames,
+    IReadOnlySet<string> SubjectBaseNames);
 
 // Whether the failing method's signature is version-conditional in the subject's source.
 //
