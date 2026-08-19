@@ -58,6 +58,29 @@ public static class RunCommand
         // comes back as CustomObject or null, so measured on a real PR that filter
         // attributed 1056 of 1056 failures to a repo that owned none of them.
         // Attribute to the exact namespaces the subject repo's own assemblies declare.
+        //
+        // What this run built, which the classifier needs to read a missing declaring
+        // assembly correctly. Null when no subject build dir was supplied: with whole-closure
+        // attribution there is no basis for calling any assembly foreign, so the
+        // reclassification is disabled and the fail-safe default stands.
+        ClosureContext? closure = null;
+        if (subjectBuildDir is not null && Directory.Exists(subjectBuildDir))
+        {
+            var loadedNames = new HashSet<string>(
+                loaded.Select(a => { try { return a.GetName().Name; } catch { return null; } })
+                      .Where(n => !string.IsNullOrEmpty(n))!,
+                StringComparer.Ordinal);
+            var subjectBases = new HashSet<string>(
+                Directory.GetFiles(subjectBuildDir, "*.dll", SearchOption.AllDirectories)
+                         .Select(f => StripConfigSuffix(Path.GetFileNameWithoutExtension(f))),
+                StringComparer.Ordinal);
+            if (subjectBases.Count > 0)
+                closure = new ClosureContext(
+                    loadedNames,
+                    new HashSet<string>(loadedNames.Select(StripConfigSuffix), StringComparer.Ordinal),
+                    subjectBases);
+        }
+
         var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectBuildDir);
         Func<string, bool> isAttributable;
         if (subjectNamespaces is null)
@@ -122,7 +145,7 @@ public static class RunCommand
                 return 1;
             }
 
-            var partial = ExtractFilteredResult(rawResult, isAttributable, unresolvableSkips, probeSignature, diagnostics);
+            var partial = ExtractFilteredResult(rawResult, isAttributable, unresolvableSkips, probeSignature, diagnostics, closure);
             allFailures.AddRange(partial.Failures);
         }
 
@@ -208,7 +231,11 @@ public static class RunCommand
         if (configuration is not null)
             Console.WriteLine($"Configuration: {configuration}");
 
-        int ambiguous = diagnostics.Count(d => d.DeclaringTypeCandidates is { Count: > 1 });
+        // Counted over real findings only, because the per-finding note below is printed from
+        // result.Failures. Counting every diagnostic made the total disagree with the detail as
+        // soon as a finding could be reclassified to unverified: the warning claimed N ambiguous
+        // findings while fewer than N were listed.
+        int ambiguous = diagnostics.Count(d => d.CountedAsReal && d.DeclaringTypeCandidates is { Count: > 1 });
         if (ambiguous > 0)
             Console.Error.WriteLine(
                 $"::warning title=Versioning::{ambiguous} finding(s) have a declaring type present in more than one loaded assembly, " +
@@ -350,7 +377,8 @@ public static class RunCommand
     public static VersioningResult ExtractFilteredResult(
         object? rawResult, Func<string, bool> isAttributable, List<UnverifiedFailure>? unresolvableSkips = null,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature = null,
-        List<FailureDiagnostic>? diagnostics = null)
+        List<FailureDiagnostic>? diagnostics = null,
+        ClosureContext? closure = null)
     {
         if (rawResult is null)
             return new VersioningResult
@@ -361,7 +389,7 @@ public static class RunCommand
             };
 
         var failures = new List<FailureInfo>();
-        CollectLeafFailures(rawResult, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, depth: 0);
+        CollectLeafFailures(rawResult, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, depth: 0);
 
         var status = failures.Count > 0 ? VersioningStatus.Error : VersioningStatus.Pass;
         return new VersioningResult
@@ -377,7 +405,7 @@ public static class RunCommand
         object node, Func<string, bool> isAttributable, List<FailureInfo> failures,
         List<UnverifiedFailure>? unresolvableSkips,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature,
-        List<FailureDiagnostic>? diagnostics, int depth)
+        List<FailureDiagnostic>? diagnostics, ClosureContext? closure, int depth)
     {
         // BHoM's TestResult tree has at most 3 levels under the root (outer → per-version
         // summary → individual type result). Depth 5 gives headroom for unexpected nesting
@@ -450,6 +478,39 @@ public static class RunCommand
                     path = ClassificationPath.ProbeNotSupplied;
             }
 
+            // Reclassify a finding whose recorded declaring assembly is not in
+            // this closure.
+            //
+            // candidates.Count > 0 is load-bearing and is the difference from v1. It means
+            // some OTHER loaded assembly answered for the type, so the probe verdict above
+            // describes code we were never asked about. When nothing answered, the path is
+            // DeclaringTypeNotLoaded, which is the signal that the type is genuinely gone;
+            // reclassifying that would convert a real removal into a silent pass.
+            if (cause is null && closure is not null && declaringAssembly is not null
+                && candidates.Count > 0
+                && !closure.LoadedNames.Contains(declaringAssembly))
+            {
+                string baseName = StripConfigSuffix(declaringAssembly);
+                if (!closure.SubjectBaseNames.Contains(baseName))
+                {
+                    // Nothing this repository builds under any configuration, and something
+                    // else answered for the type, so the entry is another repository's.
+                    cause = $"{declaringAssembly} (declaring assembly is not part of this repository)";
+                    path = ClassificationPath.ForeignDeclaringAssembly;
+                }
+                else if (closure.LoadedBaseNames.Contains(baseName))
+                {
+                    // Ours, and a sibling configuration of the same family is loaded, so the
+                    // family exists and only this configuration was not compiled.
+                    cause = $"{declaringAssembly} (build configuration not compiled in this run)";
+                    path = ClassificationPath.ConfigurationNotBuilt;
+                }
+                // Otherwise the family is ours but no configuration of it is loaded at all.
+                // "Not compiled" and "removed outright" are indistinguishable there, so the
+                // finding is left real. Ordering matters: folding this into the condition
+                // above makes the branch unreachable, which is how v1 lost it.
+            }
+
             if (cause is not null)
                 unresolvableSkips?.Add(new UnverifiedFailure(label, cause));
             else
@@ -469,7 +530,7 @@ public static class RunCommand
             {
                 string childStatus = child.GetType().GetProperty("Status")?.GetValue(child)?.ToString() ?? "Pass";
                 if (childStatus is "Error" or "Warning")
-                    CollectLeafFailures(child, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, depth + 1);
+                    CollectLeafFailures(child, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, depth + 1);
             }
         }
     }
@@ -715,6 +776,13 @@ public static class RunCommand
     // reached through two helper layers that take no context parameter, and threading one
     // through both for two constant values would be a wider change than the values justify.
     private static string? s_configuration;
+    // Collapses a build-configuration suffix to the family name. Anchored and
+    // restricted to 20xx because that is the only config-variant convention in the fleet
+    // today: measured 295 of 640 assemblies match, all Revit, all with a sibling variant.
+    // It is a naming heuristic over an unenforced convention, not a declared relationship.
+    internal static string StripConfigSuffix(string assemblyName)
+        => Regex.Replace(assemblyName, @"_20\d{2}$", string.Empty);
+
     private static HashSet<string>? s_versionConditional;
     private static int s_subjectAssemblyCount;
     private static int s_subjectTypeCount;
