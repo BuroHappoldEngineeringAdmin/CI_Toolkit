@@ -281,10 +281,29 @@ public static class RunCommand
     private static readonly Regex _revitAssemblyPattern =
         new(@"Revit_\w+20\d{2}\.dll$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    // Load order decides classification, so it must not be left to the filesystem.
+    //
+    // ProbeDeclaringType walks the loaded list and takes its verdict from the FIRST
+    // assembly that yields the declaring type. Where two repos declare the same type,
+    // whichever is enumerated first decides whether the finding reads as a genuine
+    // regression or as an infrastructure problem. That is CI_Toolkit#161's mechanism:
+    // BH.Revit.Engine.Core.Compute is defined by both Revit_Core_Engine and
+    // Revit_ModelQA_Engine, and 42 such type-level collisions exist across the fleet.
+    //
+    // Directory.GetFiles documents no ordering. Measured on windows-2025-vs2026 across
+    // four cold-rebuild runs on separate runners, NTFS returned exactly
+    // StringComparer.OrdinalIgnoreCase order every time (132 and 111 entries), so
+    // sorting is a no-op there and this is defensive rather than corrective. The
+    // comparer is not interchangeable: OrdinalIgnoreCase uppercases before comparing,
+    // which puts '_' (0x5F) after letters, so RevitAPIUI sorts before Revit_Adapter.
+    // A lowercase-based sort reverses that pair and would change which assembly answers.
+    internal static IReadOnlyList<string> OrderForLoad(IEnumerable<string> files)
+        => files.OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase).ToArray();
+
     private static List<Assembly> LoadAssemblies(string folder)
     {
         var loaded = new List<Assembly>();
-        foreach (string file in Directory.GetFiles(folder))
+        foreach (string file in OrderForLoad(Directory.GetFiles(folder)))
         {
             if (IsLoadableAssembly(file))
             {
