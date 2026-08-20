@@ -78,3 +78,53 @@ function Select-AltConfigs {
 
     return $selected.ToArray()
 }
+
+function Get-AltConfigSelectionError {
+    <#
+    .SYNOPSIS
+      Returns an error message when a non-empty altConfigs.txt selected nothing, or $null.
+
+    .DESCRIPTION
+      Separated from Select-AltConfigs for the same reason Select-AltConfigs is separated
+      from Build-AltConfigs: the decision is testable without invoking a build.
+
+      A file with content that selects nothing is an error, not a quiet no-op. An earlier
+      ci-versioning draft filtered entries on their org/repo segments against
+      github.repository. On a fork those never match, so it selected nothing, built
+      nothing, printed nothing and reported success. The absence of a signal was the
+      damage; the filter was only how the silence arose.
+
+      Failing is safe because the alternative shape does not exist. Measured across the
+      fleet: 14 repositories carry altConfigs.txt, each exactly 10 lines, 5 Release and 5
+      Debug. None is Debug-only, so "non-empty but nothing selected for Release" has no
+      legitimate instance today. If one appears, this fails loudly and someone decides.
+
+    .PARAMETER Lines
+      Raw lines from altConfigs.txt.
+
+    .PARAMETER Selected
+      What Select-AltConfigs returned for those lines.
+
+    .PARAMETER Configuration
+      Configuration prefix that was requested, used in the message.
+    #>
+    [CmdletBinding()]
+    param(
+        # AllowNull on both is not padding. Select-AltConfigs returns ToArray(), and
+        # PowerShell unrolls an empty array to $null on assignment, so the empty case
+        # arrives here as $null from any ordinary caller. Rejecting it replaces this
+        # function's message with a parameter-binding error, which is the silent-to-
+        # useless failure it exists to prevent. Observed on a real runner.
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]]$Selected,
+        [Parameter(Mandatory)][string]$Configuration
+    )
+
+    if ($Selected.Count -gt 0) { return $null }
+
+    $meaningful = @($Lines | Where-Object { $null -ne $_ -and $_.Trim() -and -not $_.Trim().StartsWith('#') })
+    if ($meaningful.Count -eq 0) { return $null }
+
+    $seen = ($meaningful | ForEach-Object { $_.Trim() }) -join '; '
+    return "altConfigs.txt has $($meaningful.Count) entr(ies) but none selected for '$Configuration*'. Expected at least one. Entries seen: $seen"
+}

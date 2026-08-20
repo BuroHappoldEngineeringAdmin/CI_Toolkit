@@ -163,6 +163,29 @@ runs:
         dotnet restore "${{ steps.solution.outputs.path }}"
         dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m -clp:ErrorsOnly
 
+    # The caller's own alternate configurations, via the same script ci-build uses.
+    #
+    # The versioning datasets record which assembly declared each method, and on Revit
+    # repos that is a year-suffixed assembly per configuration. resolve-dependencies
+    # already builds every dependency's Release* configurations, so a dependent repo's
+    # closure carries them; measured on a sandbox Revit tool, 25 year-suffixed assemblies
+    # present before its own build. The caller is the only gap: measured on sandbox
+    # Revit_Toolkit, 0 year-suffixed after dependencies and 2 after its Release-only
+    # build, against 10 lines in its altConfigs.txt.
+    #
+    # Cost, measured on windows-2025-vs2026 over three runs: the first configuration takes
+    # 47-59s and carries the warm-up, each additional one 4-8s, so 76s against a 47s
+    # Release-only baseline. 1.6x, not the 5x a per-configuration estimate suggests.
+    - name: Build alt configurations
+      id: build_alt
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        # GITHUB_ACTION_PATH is .github/actions/ci-versioning, so ../../scripts is
+        # .github/scripts. Same derivation prepare-runner already uses.
+        $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Build-AltConfigs.ps1"
+        & $script -SlnPath "${{ steps.solution.outputs.path }}" -Configuration "Release"
+
     # There is deliberately no build-completeness fast-fail here any more.
     #
     # A "Fast-fail on missing versioning-critical DLLs" step used to download

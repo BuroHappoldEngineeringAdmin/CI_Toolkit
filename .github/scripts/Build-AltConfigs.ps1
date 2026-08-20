@@ -45,10 +45,23 @@ if ($legacyProjects.Count -gt 0) {
     exit 1
 }
 
-$configs = Select-AltConfigs -Lines @(Get-Content altConfigs.txt) -Configuration $Configuration
+$altLines = @(Get-Content altConfigs.txt)
+# @() for array semantics below. Select-AltConfigs returns ToArray() and PowerShell
+# unrolls an empty array to $null on assignment, so without it $configs is $null whenever
+# nothing matched. Get-AltConfigSelectionError tolerates that itself (AllowNull, covered
+# by tests), so this is clarity rather than the thing preventing the failure.
+$configs  = @(Select-AltConfigs -Lines $altLines -Configuration $Configuration)
+
+# A file with content but no selection is an error, not a quiet no-op. Rationale and the
+# measurement behind it are on Get-AltConfigSelectionError.
+$selectionError = Get-AltConfigSelectionError -Lines $altLines -Selected $configs -Configuration $Configuration
+if ($selectionError) {
+    Write-Host "::error title=Build::$selectionError"
+    exit 1
+}
 
 if ($configs.Count -eq 0) {
-    Write-Host "::notice::altConfigs.txt lists no '$Configuration*' configurations. Nothing to build."
+    Write-Host "::notice::altConfigs.txt is empty. Nothing to build."
     exit 0
 }
 
