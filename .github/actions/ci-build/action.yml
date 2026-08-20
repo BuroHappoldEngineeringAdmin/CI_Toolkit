@@ -120,7 +120,9 @@ runs:
       if: steps.changed.outputs.count != '0'
       shell: pwsh
       run: |
-        $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Build-AltConfigs.ps1"
+        # Shared with ci-versioning and resolve-dependencies. GITHUB_ACTION_PATH is
+        # .github/actions/ci-build, so ../../scripts is .github/scripts.
+        $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Build-AltConfigs.ps1"
         & $script -SlnPath "${{ steps.solution.outputs.path }}" -Configuration "Release"
 
     # ci-build had no job summary at all. It is the check most likely to fail, and on
@@ -143,7 +145,7 @@ runs:
 
         $altCount = 0
         if (Test-Path 'altConfigs.txt') {
-          $script = Join-Path $env:GITHUB_ACTION_PATH "scripts/Select-AltConfigs.ps1"
+          $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Select-AltConfigs.ps1"
           if (Test-Path $script) {
             . $script
             $altCount = @(Select-AltConfigs -Lines (Get-Content 'altConfigs.txt') -Configuration 'Release').Count

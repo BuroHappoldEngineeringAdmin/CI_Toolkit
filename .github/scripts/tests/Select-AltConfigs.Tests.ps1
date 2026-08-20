@@ -15,7 +15,7 @@
 
 BeforeAll {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
-    . (Join-Path $repoRoot '.github/actions/ci-build/scripts/Select-AltConfigs.ps1')
+    . (Join-Path $repoRoot '.github/scripts/Select-AltConfigs.ps1')
 }
 
 Describe 'Select-AltConfigs' {
@@ -133,5 +133,47 @@ Describe 'Select-AltConfigs' {
         It 'returns nothing when no line matches, so the caller can skip the build entirely' {
             Select-AltConfigs -Lines @('Org/Repo/Debug2024') -Configuration 'Release' | Should -HaveCount 0
         }
+    }
+}
+
+Describe 'Get-AltConfigSelectionError' {
+
+    # Positive control: the mechanism must be shown to fire. This is the exact shape the
+    # org/repo filter produced on a fork, where it selected nothing and said nothing.
+    It 'errors when the file has entries but nothing was selected' {
+        $lines = @('BHoM/Revit_Toolkit/Release2022', 'BHoM/Revit_Toolkit/Release2023')
+        $err = Get-AltConfigSelectionError -Lines $lines -Selected @() -Configuration 'Release'
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike '*2 entr(ies)*'
+        $err | Should -BeLike '*Release2022*'
+    }
+
+    It 'names the entries it saw, so the cause is visible without a re-run' {
+        $err = Get-AltConfigSelectionError -Lines @('Other/Repo/Release2024') -Selected @() -Configuration 'Release'
+        $err | Should -BeLike '*Other/Repo/Release2024*'
+    }
+
+    # Negative controls: it must not fire where silence is correct, or it becomes noise
+    # that gets suppressed and the positive case is lost with it.
+    It 'is silent when configurations were selected' {
+        Get-AltConfigSelectionError -Lines @('BHoM/Revit_Toolkit/Release2022') -Selected @('Release2022') -Configuration 'Release' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'is silent on an absent or empty file' {
+        Get-AltConfigSelectionError -Lines @() -Selected @() -Configuration 'Release' | Should -BeNullOrEmpty
+    }
+
+    It 'is silent when the file holds only blanks and comments' {
+        Get-AltConfigSelectionError -Lines @('', '   ', '# nothing here') -Selected @() -Configuration 'Release' |
+            Should -BeNullOrEmpty
+    }
+
+    # Documents a deliberate choice rather than an oversight. A Debug-only file selects
+    # nothing for Release and WILL fail. No repository has one: measured across the fleet,
+    # 14 files, all 5 Release and 5 Debug. If one appears the failure is the signal.
+    It 'errors on a Debug-only file, which no repository currently has' {
+        Get-AltConfigSelectionError -Lines @('BHoM/X/Debug2022') -Selected @() -Configuration 'Release' |
+            Should -Not -BeNullOrEmpty
     }
 }

@@ -6,6 +6,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# .github/actions/resolve-dependencies/scripts -> ../../../scripts is .github/scripts.
+. (Join-Path $PSScriptRoot '../../../scripts/Select-AltConfigs.ps1')
+
 # Uses dotnet build for SDK-style repos. Hard-fails on non-SDK (legacy MSBuild) repos.
 function Invoke-BHoMBuild {
     param(
@@ -112,18 +115,16 @@ foreach ($ownerRepo in $order) {
             # before the caller repo builds its own alt configs.
             $depAltConfigFile = Join-Path $repoPath "altConfigs.txt"
             if (Test-Path $depAltConfigFile) {
-                $altLines = Get-Content $depAltConfigFile |
-                    ForEach-Object { $_.Trim() } |
-                    Where-Object { $_ -ne "" -and -not $_.StartsWith("#") }
+                # Selection is shared with ci-build and ci-versioning rather than repeated
+                # here. This block used to carry its own copy of the parse, which drifted:
+                # a third copy written for ci-versioning added an org/repo filter that the
+                # other two do not have, and it selected nothing on forks and on the one
+                # repository whose file names a different repo entirely.
+                $altConfigs = Select-AltConfigs -Lines @(Get-Content $depAltConfigFile) -Configuration $Configuration
 
                 Push-Location (Split-Path $solution.FullName)
                 try {
-                    foreach ($altLine in $altLines) {
-                        $altParts = $altLine.Split('/')
-                        if ($altParts.Length -lt 3) { continue }
-                        $altConfig = $altParts[2]
-                        if (-not $altConfig.StartsWith($Configuration, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-
+                    foreach ($altConfig in $altConfigs) {
                         Write-Host "  Alt config: $altConfig"
                         # -clp:ErrorsOnly for the same reason as the primary dependency
                         # build above: warnings from a dependency's alt config annotate
