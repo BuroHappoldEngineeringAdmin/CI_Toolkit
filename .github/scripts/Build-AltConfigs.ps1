@@ -46,7 +46,11 @@ if ($legacyProjects.Count -gt 0) {
 }
 
 $altLines = @(Get-Content altConfigs.txt)
-$configs  = Select-AltConfigs -Lines $altLines -Configuration $Configuration
+# @() for array semantics below. Select-AltConfigs returns ToArray() and PowerShell
+# unrolls an empty array to $null on assignment, so without it $configs is $null whenever
+# nothing matched. Get-AltConfigSelectionError tolerates that itself (AllowNull, covered
+# by tests), so this is clarity rather than the thing preventing the failure.
+$configs  = @(Select-AltConfigs -Lines $altLines -Configuration $Configuration)
 
 # A file with content but no selection is an error, not a quiet no-op. Rationale and the
 # measurement behind it are on Get-AltConfigSelectionError.

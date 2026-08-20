@@ -110,8 +110,13 @@ function Get-AltConfigSelectionError {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Selected,
+        # AllowNull on both is not padding. Select-AltConfigs returns ToArray(), and
+        # PowerShell unrolls an empty array to $null on assignment, so the empty case
+        # arrives here as $null from any ordinary caller. Rejecting it replaces this
+        # function's message with a parameter-binding error, which is the silent-to-
+        # useless failure it exists to prevent. Observed on a real runner.
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][string[]]$Selected,
         [Parameter(Mandatory)][string]$Configuration
     )
 

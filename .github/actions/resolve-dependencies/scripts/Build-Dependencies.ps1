@@ -120,7 +120,7 @@ foreach ($ownerRepo in $order) {
                 # a third copy written for ci-versioning added an org/repo filter that the
                 # other two do not have, and it selected nothing on forks and on the one
                 # repository whose file names a different repo entirely.
-                $altConfigs = Select-AltConfigs -Lines @(Get-Content $depAltConfigFile) -Configuration $Configuration
+                $altConfigs = @(Select-AltConfigs -Lines @(Get-Content $depAltConfigFile) -Configuration $Configuration)
 
                 Push-Location (Split-Path $solution.FullName)
                 try {

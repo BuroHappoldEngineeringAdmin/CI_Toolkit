@@ -169,6 +169,30 @@ Describe 'Get-AltConfigSelectionError' {
             Should -BeNullOrEmpty
     }
 
+    # The shape a real caller actually produces. Select-AltConfigs returns ToArray() and
+    # PowerShell unrolls an empty array to $null on assignment, so every ordinary caller
+    # passes $null here, not @(). The original tests only passed @() and therefore passed
+    # while the real path died on parameter binding, which a runner found and they did not.
+    It 'handles the null that an unrolled empty array produces' {
+        $err = Get-AltConfigSelectionError -Lines @('BHoM/X/Debug2022') -Selected $null -Configuration 'Release'
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike '*1 entr(ies)*'
+    }
+
+    It 'handles a null Lines collection without throwing' {
+        Get-AltConfigSelectionError -Lines $null -Selected $null -Configuration 'Release' | Should -BeNullOrEmpty
+    }
+
+    # Exercises the assignment itself rather than a hand-written literal, so the unrolling
+    # behaviour is covered end to end rather than assumed.
+    It 'is reached correctly when fed straight from Select-AltConfigs' {
+        $lines    = @('BHoM/X/Debug2022', 'BHoM/X/Debug2023')
+        $selected = Select-AltConfigs -Lines $lines -Configuration 'Release'
+        $selected | Should -BeNullOrEmpty
+        Get-AltConfigSelectionError -Lines $lines -Selected $selected -Configuration 'Release' |
+            Should -Not -BeNullOrEmpty
+    }
+
     # Documents a deliberate choice rather than an oversight. A Debug-only file selects
     # nothing for Release and WILL fail. No repository has one: measured across the fleet,
     # 14 files, all 5 Release and 5 Debug. If one appears the failure is the signal.
