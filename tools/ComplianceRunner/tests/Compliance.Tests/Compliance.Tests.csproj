@@ -20,11 +20,35 @@
     <ProjectReference Include="..\..\src\Shared\Compliance.Shared\Compliance.Shared.csproj" />
   </ItemGroup>
 
+  <!--
+    This project holds the BHoM-DEPENDENT half of the suite and does not run in CI.
+    The BHoM-free half moved to ../Compliance.Unit.Tests, which runs in test-tools.yml.
+
+    What is left here and why each item cannot move:
+      Unit/CheckMetadataTests.cs    CheckMetadata.GetOutput takes a BH.oM.Test.TestStatus.
+      Unit/OutputEmitterTests.cs    OutputEmitter.Write takes a BH.oM.Test.TestStatus.
+      Unit/AnnotationConvertTests.cs  Constructs BH.oM.Test.CodeCompliance.Error and
+                                      exercises the ITestInformation conversion path.
+      Integration/*                 Invoke the built runner executables against real engines.
+
+    Note the boundary is NOT unit-versus-integration: three of the six original unit test
+    files are BHoM-dependent. For CheckMetadata and OutputEmitter the whole dependency is a
+    single enum parameter, which is thin but real, and narrowing it would mean changing
+    production signatures.
+
+    To make this project run, the calling workflow must first build Test_Toolkit so that
+    CodeComplianceTest_oM.dll exists in C:\ProgramData\BHoM\Assemblies. On a machine with
+    only the BHoM installer present, the other four HintPaths resolve and that one does not,
+    which is the single error that currently takes the project down (CS0234 on
+    BH.oM.Test.CodeCompliance in Compliance.Shared/AnnotationConvert.cs). The mechanism
+    already exists: the resolve-dependencies action in mode `seeds` with seed BHoM/Test_Toolkit,
+    which is exactly what ci-compliance does before invoking the runner.
+  -->
+
   <ItemGroup>
     <!--
       BHoM assemblies required at compile-time (for TestStatus in CheckMetadataTests)
       and by integration tests that invoke the runner executables against real BHoM engines.
-      Structural unit tests (SarifBuilder, ArgParser, FileFilter) do not need BHoM at runtime.
     -->
     <Reference Include="BHoM">
       <HintPath>$(ProgramData)\BHoM\Assemblies\BHoM.dll</HintPath>

@@ -6,11 +6,20 @@
 # all: PR #131 reported zero. That left every runner regression test inert, including the
 # one added in #131 to stop the System.Drawing.Common reference being dropped as unused.
 #
-# Compliance.Tests is deliberately NOT run here. Compliance.Shared references BHoM.dll,
-# BHoM_Engine.dll, CodeComplianceTest_oM.dll, Test_Engine.dll and Test_oM.dll by HintPath
-# out of C:\ProgramData\BHoM\Assemblies, so it cannot even compile without a BHoM install
-# plus a built Test_Toolkit. Adding it needs the dependency-resolution step and belongs in
-# a separate change; a job that fails for environmental reasons is worse than no job.
+# ComplianceRunner's tests are split across two projects, and only one of them can run here.
+#
+# Compliance.Unit.Tests DOES run: it compiles Annotation.cs, ArgParser.cs, FileFilter.cs and
+# SarifBuilder.cs directly, references no BHoM assembly, and so needs nothing installed.
+#
+# Compliance.Tests is still NOT run. It ProjectReferences Compliance.Shared, which references
+# BHoM.dll, BHoM_Engine.dll, CodeComplianceTest_oM.dll, Test_Engine.dll and Test_oM.dll by
+# HintPath out of C:\ProgramData\BHoM\Assemblies. The blocker is narrower than the whole set:
+# measured on a machine with the BHoM installer present, four of the five resolve and only
+# CodeComplianceTest_oM.dll is missing, because it ships with Test_Toolkit rather than in the
+# installer payload. AnnotationConvert.cs then fails with CS0234 on BH.oM.Test.CodeCompliance
+# and takes the whole project with it. Running it therefore needs resolve-dependencies to
+# build Test_Toolkit first, which belongs in a separate change; a job that fails for
+# environmental reasons is worse than no job.
 name: Test Tools
 
 on:
@@ -41,13 +50,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Two versions: the Serialiser and Versioning suites target net8.0-windows, matching
+      # their runners; Compliance.Unit.Tests targets net10.0, matching ComplianceRunner.
       - name: Set up .NET
         uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
         with:
-          dotnet-version: '8.0'
+          dotnet-version: |
+            8.0
+            10.x
 
       - name: SerialiserRunner tests
         run: dotnet test tools/SerialiserRunner/src/SerialiserRunner.Tests --nologo
 
       - name: VersioningRunner tests
         run: dotnet test tools/VersioningRunner/src/VersioningRunner.Tests --nologo
+
+      - name: ComplianceRunner unit tests (BHoM-free)
+        run: dotnet test tools/ComplianceRunner/tests/Compliance.Unit.Tests --nologo
