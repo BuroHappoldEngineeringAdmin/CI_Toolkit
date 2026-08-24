@@ -16,6 +16,13 @@ $shaFile    = Join-Path $depsDir "_shas.txt"
 $orderOut   = Join-Path $depsDir "_order.txt"
 $selectFile = Join-Path $depsDir "_selection.txt"
 
+# Which ref each clone was last checked out to, kept beside the clones rather than in deps/
+# because the action truncates _shas.txt and deletes _selection.txt on every invocation while
+# the clone root persists for the whole job. A flat file, not a directory: the junction loop at
+# the end of the calling action enumerates directories under the clone root and would otherwise
+# link this into the workspace parent as if it were a dependency.
+$refMarkerFile = Join-Path $cloneRoot "_selected-refs.txt"
+
 New-Item -ItemType Directory -Force -Path $cloneRoot | Out-Null
 
 if (Test-Path $selectFile) { Remove-Item $selectFile -Force }
@@ -63,6 +70,9 @@ $nameMap    = @{}  # owner/repo -> folder
 $pathMap    = @{}  # owner/repo -> path
 $folderUsed = @{}  # folder name -> owner/repo, for collision detection
 
+# What each dependency resolved to, and what it was on before, for the no-op warning at the end.
+$resolutionLog = New-Object System.Collections.Generic.List[hashtable]
+
 # Use insteadOf to inject the token at the git config level — keeps it out of command
 # arguments, process listings, and cloned repos' .git/config. Removed in a finally block
 # to avoid persisting the credential on self-hosted runners even when the script errors.
@@ -83,90 +93,132 @@ function Get-FolderName([string]$ownerRepo) {
     return $name
 }
 
+# A detached HEAD cannot report the branch it came from, so the ref each clone was checked out
+# to is recorded here and read back on a later invocation. Without it a reused clone can only be
+# described by its SHA, which does not tell a reader whether the ref was the one this leg asked
+# for. See the reporting note on the reuse path in Clone-And-Checkout.
+function Set-SelectedRefMarker([string]$name, [string]$ref) {
+    $kept = @()
+    if (Test-Path $refMarkerFile) {
+        $kept = @(Get-Content $refMarkerFile |
+                  Where-Object { $_ -notmatch "^$([regex]::Escape($name))\|" })
+    }
+    ($kept + "$name|$ref") | Set-Content -Path $refMarkerFile -Encoding utf8
+}
+
+function Get-SelectedRefMarker([string]$name) {
+    if (-not (Test-Path $refMarkerFile)) { return $null }
+    $line = Get-Content $refMarkerFile |
+            Where-Object { $_ -match "^$([regex]::Escape($name))\|" } |
+            Select-Object -First 1
+    if (-not $line) { return $null }
+    return $line.Split('|', 2)[1]
+}
+
 function Clone-And-Checkout([string]$ownerRepo, [string]$ref) {
 
     $name = Get-FolderName $ownerRepo
     $path = Join-Path $cloneRoot $name
 
-    if (-not (Test-Path (Join-Path $path ".git"))) {
-
+    # Clone if absent, then resolve the ref UNCONDITIONALLY.
+    #
+    # These two used to be one conditional: a clone that already existed was left on whatever
+    # ref a previous invocation put it on, and only its SHA was re-recorded. ci-serialisation
+    # invokes this action twice in one job, so its baseline leg inherited the branch leg's
+    # dependency refs, built the base-branch subject against branch-branch dependencies, and
+    # compared two legs that shared the same dependency code. A regression introduced on the
+    # dependency side appeared in both and cancelled out.
+    #
+    # This is BHoMBot's shape, deliberately. LoadDependencies (CodeBuild_Engine) cloned if
+    # absent and then always called CheckoutBranch with the branch as an explicit argument, and
+    # ResetBuiltRepos() cleared the memo that would otherwise have skipped the re-checkout. The
+    # divergence from BHoMBot is that the memo has no equivalent here and needs none: there is
+    # no build-dedup cache in this script, so nothing suppresses the second resolution.
+    #
+    # Cost is one shallow fetch per dependency per additional invocation, which only
+    # ci-serialisation pays. Not optimised away by comparing the remote SHA first: that adds a
+    # branch to reason about in exchange for saving a fetch nothing is waiting on.
+    $freshClone = -not (Test-Path (Join-Path $path ".git"))
+    if ($freshClone) {
         git clone "https://github.com/$ownerRepo.git" $path --no-tags --depth 1 | Out-Null
+    }
 
-        $selectedRef = $null
-        Push-Location $path
-        try {
-            $used = $false
+    $previousRef = if ($freshClone) { $null } else { Get-SelectedRefMarker $name }
 
-            if ($ref) {
-                $hasHead = git ls-remote --heads origin $ref
-                $hasTag  = git ls-remote --tags  origin $ref
-                if ($hasHead -or $hasTag) {
-                    git fetch origin $ref --depth 1 | Out-Null
-                    git checkout -q FETCH_HEAD
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$ref)" }
-                    $selectedRef = $ref
-                    $used = $true
-                } else {
-                    Write-Warning "Explicit ref '$ref' not found on '$ownerRepo' — falling back."
-                }
+    $selectedRef = $null
+    Push-Location $path
+    try {
+        $used = $false
+
+        if ($ref) {
+            $hasHead = git ls-remote --heads origin $ref
+            $hasTag  = git ls-remote --tags  origin $ref
+            if ($hasHead -or $hasTag) {
+                git fetch origin $ref --depth 1 | Out-Null
+                git checkout -q FETCH_HEAD
+                if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$ref)" }
+                $selectedRef = $ref
+                $used = $true
+            } else {
+                Write-Warning "Explicit ref '$ref' not found on '$ownerRepo' — falling back."
             }
-
-            if (-not $used) {
-                $hasPrefer   = if ($Prefer)   { git ls-remote --heads origin $Prefer }   else { $null }
-                $hasFallback = git ls-remote --heads origin $Fallback
-                if ($hasPrefer) {
-                    git fetch origin $Prefer --depth 1 | Out-Null
-                    git checkout -q FETCH_HEAD
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$Prefer)" }
-                    $selectedRef = $Prefer
-                } elseif ($hasFallback) {
-                    git fetch origin $Fallback --depth 1 | Out-Null
-                    git checkout -q FETCH_HEAD
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$Fallback)" }
-                    $selectedRef = $Fallback
-                } else {
-                    # Neither PR nor base branch exists on this dep; fall back to remote default.
-                    git fetch origin HEAD --depth 1 | Out-Null
-                    git checkout -q FETCH_HEAD
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (remote default)" }
-                    $defaultRef = (git ls-remote --symref origin HEAD |
-                        Select-String 'ref: refs/heads/(\S+)\s+HEAD' |
-                        ForEach-Object { $_.Matches[0].Groups[1].Value } |
-                        Select-Object -First 1)
-                    $selectedRef = if ($defaultRef) { $defaultRef } else { "(remote default)" }
-                }
-            }
-
-            $sha = (git rev-parse HEAD).Trim()
-            Add-Content -Path $shaFile    -Value "$ownerRepo $sha"
-            Add-Content -Path $selectFile -Value "$ownerRepo|$name|$selectedRef|$sha"
-        }
-        finally {
-            Pop-Location
         }
 
-        # Write-Host, not ::notice. A ::notice with no file= becomes a check-run
-        # annotation attributed to ".github" at the log line number, and there is one
-        # per dependency: nine on a typical ci-build run, competing with the caller's
-        # own diagnostics for GitHub's per-step annotation cap. The same information
-        # already reaches the job summary as a table at the end of this script, which
-        # is where a reader looks for it.
+        if (-not $used) {
+            $hasPrefer   = if ($Prefer)   { git ls-remote --heads origin $Prefer }   else { $null }
+            $hasFallback = git ls-remote --heads origin $Fallback
+            if ($hasPrefer) {
+                git fetch origin $Prefer --depth 1 | Out-Null
+                git checkout -q FETCH_HEAD
+                if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$Prefer)" }
+                $selectedRef = $Prefer
+            } elseif ($hasFallback) {
+                git fetch origin $Fallback --depth 1 | Out-Null
+                git checkout -q FETCH_HEAD
+                if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (ref=$Fallback)" }
+                $selectedRef = $Fallback
+            } else {
+                # Neither PR nor base branch exists on this dep; fall back to remote default.
+                git fetch origin HEAD --depth 1 | Out-Null
+                git checkout -q FETCH_HEAD
+                if ($LASTEXITCODE -ne 0) { throw "git checkout FETCH_HEAD failed for '$ownerRepo' (remote default)" }
+                $defaultRef = (git ls-remote --symref origin HEAD |
+                    Select-String 'ref: refs/heads/(\S+)\s+HEAD' |
+                    ForEach-Object { $_.Matches[0].Groups[1].Value } |
+                    Select-Object -First 1)
+                $selectedRef = if ($defaultRef) { $defaultRef } else { "(remote default)" }
+            }
+        }
+
+        # _shas.txt is reset between invocations, so this must be written every time, not only
+        # on a fresh clone. Without it the cache-key computation produces an empty keypart,
+        # skipping both the assembly cache restore and the dep build, leaving
+        # C:\ProgramData\BHoM\Assemblies empty.
+        $sha = (git rev-parse HEAD).Trim()
+        Add-Content -Path $shaFile    -Value "$ownerRepo $sha"
+        Add-Content -Path $selectFile -Value "$ownerRepo|$name|$selectedRef|$sha"
+        Set-SelectedRefMarker $name $selectedRef
+    }
+    finally {
+        Pop-Location
+    }
+
+    # Write-Host, not ::notice. A ::notice with no file= becomes a check-run
+    # annotation attributed to ".github" at the log line number, and there is one
+    # per dependency: nine on a typical ci-build run, competing with the caller's
+    # own diagnostics for GitHub's per-step annotation cap. The same information
+    # already reaches the job summary as a table at the end of this script, which
+    # is where a reader looks for it.
+    #
+    # A re-resolution that moved the clone names both refs, because "which ref is this leg
+    # building" is the question ci-serialisation's baseline leg could not previously answer.
+    if ($previousRef -and $previousRef -ne $selectedRef) {
+        Write-Host "Dependency re-resolved: $ownerRepo -> $selectedRef @ $($sha.Substring(0,7)) (was $previousRef)"
+    } else {
         Write-Host "Dependency checkout: $ownerRepo -> $selectedRef @ $($sha.Substring(0,7))"
     }
-    else {
-        # Repo already cloned (e.g. baseline run re-uses branch-build clones).
-        # _shas.txt is reset between invocations, so write the SHA even though we skip re-cloning.
-        # Without this the cache-key computation produces an empty keypart, skipping both the
-        # assembly cache restore and the dep build, leaving C:\ProgramData\BHoM\Assemblies empty.
-        Push-Location $path
-        try {
-            $sha = (git rev-parse HEAD).Trim()
-            Add-Content -Path $shaFile -Value "$ownerRepo $sha"
-        }
-        finally {
-            Pop-Location
-        }
-    }
+
+    $resolutionLog.Add(@{ Key = $ownerRepo; Previous = $previousRef; Selected = $selectedRef }) | Out-Null
 
     $nameMap[$ownerRepo] = $name
     $pathMap[$ownerRepo] = $path
@@ -323,6 +375,51 @@ if (Test-Path $selectFile) {
 
     if ($env:GITHUB_STEP_SUMMARY) {
         $mdLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+    }
+}
+
+# A repeat invocation that changed nothing is the shape of the defect this reporting exists for:
+# two passes meant to mean different things resolving to the same dependency code, so a regression
+# on the dependency side appears in both and cancels out when they are compared. Only reachable on
+# a repeat invocation, because a first pass has nothing to compare against.
+#
+# The annotation level depends on WHO asked, which is why PREFER_BRANCH_EXPLICIT exists.
+#
+#   explicit prefer_branch + nothing moved  ->  ::warning. A caller deliberately asked for a
+#       different ref and got the same one, so either the branch does not exist anywhere in the
+#       closure or the value is wrong. This is the misconfiguration worth interrupting for.
+#   something moved                         ->  ::notice naming the moves. The normal baseline.
+#   inherited default + nothing moved       ->  plain log line, no annotation. This is the
+#       ordinary case: the pull request branch exists on no dependency, so both passes
+#       legitimately resolve to the base branch. An earlier version warned here and would have
+#       fired on most baseline runs, which is worse than not warning at all.
+#
+# Never an error. Failing on same-refs would red every pull request whose branch name exists on
+# no dependency, which is most of them.
+$repeated = @($resolutionLog | Where-Object { $_.Previous })
+if ($repeated.Count -gt 0) {
+    $moved       = @($repeated | Where-Object { $_.Previous -ne $_.Selected })
+    $wasExplicit = $env:PREFER_BRANCH_EXPLICIT -eq 'true'
+
+    if ($moved.Count -gt 0) {
+        Write-Host ("::notice title=resolve-dependencies::Repeat resolution moved " +
+                    "$($moved.Count) of $($repeated.Count) already-present dependenc(ies): " +
+                    (($moved | ForEach-Object { "$($_.Key) $($_.Previous)->$($_.Selected)" }) -join ', '))
+    }
+    elseif ($wasExplicit) {
+        Write-Host ("::warning title=resolve-dependencies::prefer_branch was set explicitly to " +
+                    "'$Prefer' but no dependency moved: all $($repeated.Count) already-present " +
+                    "dependenc(ies) stayed on the ref the previous invocation selected. Either that " +
+                    "branch exists on none of them, which is expected and harmless, or the value is " +
+                    "wrong. If it is wrong, this pass is building against the same dependency code " +
+                    "as the previous one, so any comparison between the two passes cannot see a " +
+                    "regression that came from a dependency: it is present on both sides and " +
+                    "cancels out.")
+    }
+    else {
+        Write-Host ("Repeat resolution changed nothing: all $($repeated.Count) already-present " +
+                    "dependenc(ies) stayed on '$Prefer', which was inherited from the event rather " +
+                    "than requested. Ordinary for a pull request whose branch exists on no dependency.")
     }
 }
 
