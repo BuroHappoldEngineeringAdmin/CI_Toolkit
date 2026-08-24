@@ -21,8 +21,11 @@
   </ItemGroup>
 
   <!--
-    This project holds the BHoM-DEPENDENT half of the suite and does not run in CI.
-    The BHoM-free half moved to ../Compliance.Unit.Tests, which runs in test-tools.yml.
+    This project holds the BHoM-DEPENDENT half of the suite. It runs in test-tools.yml's
+    compliance-tests job, which resolves the Test_Toolkit dependency graph first so that
+    CodeComplianceTest_oM.dll exists and this project can compile. The BHoM-free half moved
+    to ../Compliance.Unit.Tests, which runs in the hermetic dotnet-tests job instead and
+    needs nothing installed.
 
     What is left here and why each item cannot move:
       Unit/CheckMetadataTests.cs    CheckMetadata.GetOutput takes a BH.oM.Test.TestStatus.
@@ -35,14 +38,6 @@
     files are BHoM-dependent. For CheckMetadata and OutputEmitter the whole dependency is a
     single enum parameter, which is thin but real, and narrowing it would mean changing
     production signatures.
-
-    To make this project run, the calling workflow must first build Test_Toolkit so that
-    CodeComplianceTest_oM.dll exists in C:\ProgramData\BHoM\Assemblies. On a machine with
-    only the BHoM installer present, the other four HintPaths resolve and that one does not,
-    which is the single error that currently takes the project down (CS0234 on
-    BH.oM.Test.CodeCompliance in Compliance.Shared/AnnotationConvert.cs). The mechanism
-    already exists: the resolve-dependencies action in mode `seeds` with seed BHoM/Test_Toolkit,
-    which is exactly what ci-compliance does before invoking the runner.
   -->
 
   <ItemGroup>
