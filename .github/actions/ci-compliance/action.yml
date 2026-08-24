@@ -157,10 +157,10 @@ runs:
 
           $summary = @("### $check compliance $status")
           if ($coverage) {
-            # Reworded from the runner's own line so the summary reads as prose. The counts are
-            # the runner's; only the framing is this action's.
+            # Verbatim. Rewording it here would put the same sentence in two places and let
+            # them drift; the runner owns the wording and this owns where it appears.
             $summary += ""
-            $summary += ($coverage -replace '^Coverage: ', 'Files examined: ')
+            $summary += $coverage
           }
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
         }

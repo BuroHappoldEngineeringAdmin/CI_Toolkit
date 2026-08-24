@@ -30,7 +30,7 @@ Describe 'ci-compliance action.yml' {
         }
 
         It 'carries the examined count into the summary, not only pass or fail' {
-            $text | Should -Match 'Files examined' -Because 'a run that examined every file and one that examined none must not produce the same summary'
+            $text | Should -Match '\$summary \+= \$coverage' -Because 'a run that examined every file and one that examined none must not produce the same summary'
         }
 
         # The count is the runner's, read back off one line it controls. If that line is ever
