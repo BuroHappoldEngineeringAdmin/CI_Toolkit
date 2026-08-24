@@ -37,16 +37,18 @@ class DatasetComplianceRunner
 
         var mergedResult   = new TestResult() { Status = TestStatus.Pass, Information = new List<ITestInformation>() };
         var allAnnotations = new List<Annotation>();
+        var accounting     = new FileAccounting(files.Count);
 
         foreach (var file in files)
         {
             // Only .json files under a datasets/ path are in scope.
-            if (!FileFilter.IsDatasetFile(file)) continue;
+            if (!FileFilter.IsDatasetFile(file)) { accounting.CountNotRelevant(); continue; }
 
             if (verbose) Console.WriteLine($"\n=== Checking: {file} ===");
 
             if (!File.Exists(file))
             {
+                accounting.CountNotOnDisk();
                 Console.WriteLine($"  [SKIP] File not found: {file}");
                 continue;
             }
@@ -55,12 +57,14 @@ class DatasetComplianceRunner
 
             if (resultForThisFile == null)
             {
+                accounting.CountNoResult();
                 Console.WriteLine($"  [SKIP] No result returned for: {file}");
                 continue;
             }
 
             if (verbose) Console.WriteLine($"  Result Status: {resultForThisFile.Status}");
 
+            accounting.CountExamined();
             mergedResult = mergedResult.Merge(resultForThisFile);
 
             var information        = resultForThisFile.Information ?? Enumerable.Empty<ITestInformation>();
@@ -94,7 +98,8 @@ class DatasetComplianceRunner
 
         const string checkType = "dataset";
         OutputEmitter.Write(outputFormat, checkType, mergedResult.Status, allAnnotations, sarifFilePath, verbose,
-            BH.Engine.Base.Query.DocumentationURL("DevOps/Code%20Compliance%20and%20CI/Compliance%20Checks/"));
+            BH.Engine.Base.Query.DocumentationURL("DevOps/Code%20Compliance%20and%20CI/Compliance%20Checks/"),
+            accounting);
 
         // Exit code mirrors BHoMBot: failure only on Error; Warning and Pass are both success.
         return mergedResult.Status == TestStatus.Error ? 1 : 0;

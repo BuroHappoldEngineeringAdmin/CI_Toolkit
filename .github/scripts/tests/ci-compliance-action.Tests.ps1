@@ -29,14 +29,15 @@ Describe 'ci-compliance action.yml' {
             $text | Should -Match '::group::' -Because 'if this stops being true the reasoning below needs revisiting'
         }
 
-        # Characterisation, like the runner tests that accompany it: this asserts what the
-        # summary says today so the absence is recorded rather than described. It should become
-        # a -Match once the summary carries the examined count.
-        It 'reports only pass or fail, with no count of what was examined' {
-            $summaryLines = ($lines | Select-String -Pattern 'GITHUB_STEP_SUMMARY' -Context 0, 8 |
-                             ForEach-Object { $_.Context.PostContext }) -join "`n"
+        It 'carries the examined count into the summary, not only pass or fail' {
+            $text | Should -Match 'Files examined' -Because 'a run that examined every file and one that examined none must not produce the same summary'
+        }
 
-            $summaryLines | Should -Not -Match 'examined' -Because 'a run that examined every file and one that examined none currently produce the same summary'
+        # The count is the runner's, read back off one line it controls. If that line is ever
+        # renamed on one side only, the summary silently loses the count rather than breaking,
+        # so both ends of the contract are asserted here.
+        It 'reads the count off the line the runner emits' {
+            $text | Should -Match "match '\^Coverage: '"
         }
     }
 }

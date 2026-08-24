@@ -38,16 +38,18 @@ class ComplianceRunner
 
         var mergedResult   = new TestResult() { Status = TestStatus.Pass, Information = new List<ITestInformation>() };
         var allAnnotations = new List<Annotation>();
+        var accounting     = new FileAccounting(files.Count);
 
         foreach (var file in files)
         {
             // Each check type is only relevant to certain file extensions.
-            if (!FileFilter.IsRelevantFile(file, checkType)) continue;
+            if (!FileFilter.IsRelevantFile(file, checkType)) { accounting.CountNotRelevant(); continue; }
 
             if (verbose) Console.WriteLine($"\n=== Checking: {file} ===");
 
             if (!File.Exists(file))
             {
+                accounting.CountNotOnDisk();
                 Console.WriteLine($"  [SKIP] File not found: {file}");
                 continue;
             }
@@ -114,12 +116,14 @@ class ComplianceRunner
 
             if (resultForThisFile == null)
             {
+                accounting.CountNoResult();
                 Console.WriteLine($"  [SKIP] No result returned for: {file}");
                 continue;
             }
 
             if (verbose) Console.WriteLine($"  Result Status: {resultForThisFile.Status}");
 
+            accounting.CountExamined();
             mergedResult = mergedResult.Merge(resultForThisFile);
 
             // Code/copyright/documentation findings have been through GroupErrors, whose
@@ -156,7 +160,8 @@ class ComplianceRunner
         }
 
         OutputEmitter.Write(outputFormat, checkType, mergedResult.Status, allAnnotations, sarifFilePath, verbose,
-            BH.Engine.Base.Query.DocumentationURL("DevOps/Code%20Compliance%20and%20CI/Compliance%20Checks/"));
+            BH.Engine.Base.Query.DocumentationURL("DevOps/Code%20Compliance%20and%20CI/Compliance%20Checks/"),
+            accounting);
 
         // Exit code mirrors BHoMBot: failure only on Error; Warning and Pass are both success.
         return mergedResult.Status == TestStatus.Error ? 1 : 0;

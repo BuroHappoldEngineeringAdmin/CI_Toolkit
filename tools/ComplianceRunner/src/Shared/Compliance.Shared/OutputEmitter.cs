@@ -26,9 +26,31 @@ public static class OutputEmitter
         List<Annotation> annotations,
         string? sarifFilePath,
         bool verbose,
-        string toolUri)
+        string toolUri,
+        FileAccounting? accounting = null)
     {
         CheckMetadata.GetOutput(checkType, status, out string title, out string summary, out string text);
+
+        // Coverage goes to stdout only for the two human-facing formats. json and sarif put a
+        // payload on stdout and nothing else may precede it: an unconditional Console.WriteLine
+        // here is exactly how the [SKIP] diagnostic already breaks a caller that parses stdout
+        // directly. The counts still reach machine-readable consumers, structurally, below.
+        if (accounting is not null && (outputFormat == "console" || outputFormat == "github"))
+        {
+            Console.WriteLine(accounting.CoverageLine());
+
+            // Reported, never failed. Whether examining nothing should fail is a separate and
+            // undecided question; this only makes the state visible, and it is emitted as a
+            // workflow command so it survives the collapsed log group the caller wraps this in.
+            if (accounting.ExaminedNothing)
+            {
+                string warning = accounting.ExaminedNothingWarning();
+                if (outputFormat == "github")
+                    Console.WriteLine($"::warning title=Compliance coverage::{warning}");
+                else
+                    Console.WriteLine($"WARNING: {warning}");
+            }
+        }
 
         if (verbose)
         {
@@ -84,6 +106,7 @@ public static class OutputEmitter
                 ["summary"]         = summary,
                 ["text"]            = text,
                 ["annotationCount"] = annotations.Count,
+                ["coverage"]        = accounting?.ToPayload() ?? new Dictionary<string, object>(),
                 ["annotations"]     = annotations.Select(a => new Dictionary<string, object>
                 {
                     ["path"]             = a.FilePath,
