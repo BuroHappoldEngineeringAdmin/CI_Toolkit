@@ -6,18 +6,26 @@
 # all: PR #131 reported zero. That left every runner regression test inert, including the
 # one added in #131 to stop the System.Drawing.Common reference being dropped as unused.
 #
-# Two jobs, deliberately separate.
+# Two jobs and two ComplianceRunner test projects, deliberately separate.
 #
 #   dotnet-tests       Hermetic. Checkout, SDK, run. No network beyond NuGet, no BHoM.
+#                      SerialiserRunner, VersioningRunner and Compliance.Unit.Tests.
 #   compliance-tests   Resolves the Test_Toolkit dependency graph first, so Compliance.Tests
 #                      can compile and its entry-point tests can run.
+#
+# Why the ComplianceRunner suite is split across two projects. Compliance.Unit.Tests compiles
+# Annotation.cs, ArgParser.cs, FileFilter.cs and SarifBuilder.cs directly instead of
+# project-referencing Compliance.Shared, so it pulls in no BHoM assembly and runs in the
+# hermetic job with nothing installed. Compliance.Tests holds everything that cannot: the three
+# unit files that take a BHoM type as a parameter, and the integration files that invoke the
+# built runner executables.
 #
 # Why Compliance.Tests needs the second job. Compliance.Shared HintPaths five assemblies out
 # of C:\ProgramData\BHoM\Assemblies. Measured on a machine carrying the BHoM installer, four
 # resolve and only CodeComplianceTest_oM.dll is missing, because it is built by
 # BHoM/Test_Toolkit (CodeCompliance_oM/CodeComplianceTest_oM.csproj) rather than shipped in
 # the installer payload. AnnotationConvert.cs then fails CS0234 on BH.oM.Test.CodeCompliance
-# and takes the whole project down, which is why all nine of its test files were inert.
+# and takes the whole project down.
 #
 # resolve-dependencies in mode: seeds with seed BHoM/Test_Toolkit is exactly what ci-compliance
 # already does before prepare-runner publishes ComplianceRunner, and ComplianceRunner.csproj
@@ -58,16 +66,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Two versions: the Serialiser and Versioning suites target net8.0-windows, matching
+      # their runners; Compliance.Unit.Tests targets net10.0, matching ComplianceRunner.
       - name: Set up .NET
         uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
         with:
-          dotnet-version: '8.0'
+          dotnet-version: |
+            8.0
+            10.x
 
       - name: SerialiserRunner tests
         run: dotnet test tools/SerialiserRunner/src/SerialiserRunner.Tests --nologo
 
       - name: VersioningRunner tests
         run: dotnet test tools/VersioningRunner/src/VersioningRunner.Tests --nologo
+
+      - name: ComplianceRunner unit tests (BHoM-free)
+        run: dotnet test tools/ComplianceRunner/tests/Compliance.Unit.Tests --nologo
 
   # ComplianceRunner's own suite, including the entry-point characterisation tests. Needs
   # CodeComplianceTest_oM.dll, so it builds the Test_Toolkit graph first. See the header.

@@ -20,11 +20,30 @@
     <ProjectReference Include="..\..\src\Shared\Compliance.Shared\Compliance.Shared.csproj" />
   </ItemGroup>
 
+  <!--
+    This project holds the BHoM-DEPENDENT half of the suite. It runs in test-tools.yml's
+    compliance-tests job, which resolves the Test_Toolkit dependency graph first so that
+    CodeComplianceTest_oM.dll exists and this project can compile. The BHoM-free half moved
+    to ../Compliance.Unit.Tests, which runs in the hermetic dotnet-tests job instead and
+    needs nothing installed.
+
+    What is left here and why each item cannot move:
+      Unit/CheckMetadataTests.cs    CheckMetadata.GetOutput takes a BH.oM.Test.TestStatus.
+      Unit/OutputEmitterTests.cs    OutputEmitter.Write takes a BH.oM.Test.TestStatus.
+      Unit/AnnotationConvertTests.cs  Constructs BH.oM.Test.CodeCompliance.Error and
+                                      exercises the ITestInformation conversion path.
+      Integration/*                 Invoke the built runner executables against real engines.
+
+    Note the boundary is NOT unit-versus-integration: three of the six original unit test
+    files are BHoM-dependent. For CheckMetadata and OutputEmitter the whole dependency is a
+    single enum parameter, which is thin but real, and narrowing it would mean changing
+    production signatures.
+  -->
+
   <ItemGroup>
     <!--
       BHoM assemblies required at compile-time (for TestStatus in CheckMetadataTests)
       and by integration tests that invoke the runner executables against real BHoM engines.
-      Structural unit tests (SarifBuilder, ArgParser, FileFilter) do not need BHoM at runtime.
     -->
     <Reference Include="BHoM">
       <HintPath>$(ProgramData)\BHoM\Assemblies\BHoM.dll</HintPath>

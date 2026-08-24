@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The BHoM-free half of the ComplianceRunner test suite, split out so it can run in CI.
+
+    Compliance.Tests cannot compile without a BHoM install AND a built Test_Toolkit: its
+    ProjectReference to Compliance.Shared drags in AnnotationConvert.cs, which needs
+    BH.oM.Test.CodeCompliance from CodeComplianceTest_oM.dll. That assembly ships with
+    Test_Toolkit, not with the installer payload, so even a machine with BHoM installed
+    cannot build it. Result: every test in that project has been inert since it was written.
+
+    This project deliberately has NO ProjectReference to Compliance.Shared. It compiles the
+    four source files that reference no BHoM type directly into the test assembly, so it
+    builds and runs on a bare runner with no BHoM install and no Test_Toolkit.
+
+    Those four files were verified free of BHoM types by reading them, not by their names:
+    every "BHoM" occurrence in them is a comment or a string literal (e.g. the "BHoM.<check>"
+    SARIF ruleId prefix). The three excluded source files have real dependencies:
+    CheckMetadata and OutputEmitter take a BH.oM.Test.TestStatus parameter, and
+    AnnotationConvert consumes BH.oM.Test.CodeCompliance.Error and ITestInformation.
+
+    NUnit rather than the xUnit used by SerialiserRunner.Tests and VersioningRunner.Tests.
+    The three test files here were moved verbatim from Compliance.Tests, which is an NUnit
+    project; rewriting ~350 lines of assertions into xUnit would risk changing what they
+    assert, and the point of this change is to find out what they do assert. Harmonising the
+    two frameworks is a separate decision.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Compliance.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit"                  Version="3.14.0" />
+    <PackageReference Include="NUnit3TestAdapter"      Version="4.6.0" />
+    <PackageReference Include="NUnit.Analyzers"        Version="3.6.1" />
+    <PackageReference Include="coverlet.collector"     Version="6.0.2" />
+  </ItemGroup>
+
+  <!--
+    Source under test, linked rather than project-referenced. Keep this list in step with
+    Compliance.Shared: a new file there that references no BHoM type belongs here too, and
+    one that does must not be added or this project stops building on a bare runner.
+  -->
+  <ItemGroup>
+    <Compile Include="..\..\src\Shared\Compliance.Shared\Annotation.cs"   Link="Linked\Annotation.cs" />
+    <Compile Include="..\..\src\Shared\Compliance.Shared\ArgParser.cs"    Link="Linked\ArgParser.cs" />
+    <Compile Include="..\..\src\Shared\Compliance.Shared\FileFilter.cs"   Link="Linked\FileFilter.cs" />
+    <Compile Include="..\..\src\Shared\Compliance.Shared\SarifBuilder.cs" Link="Linked\SarifBuilder.cs" />
+  </ItemGroup>
+
+</Project>

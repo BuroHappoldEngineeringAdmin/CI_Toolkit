@@ -11,7 +11,8 @@ using System.Diagnostics;
 ///   2. ComplianceRunner then asks FileFilter.IsRelevantFile of every file it was handed.
 ///
 /// Each half has tests. `.github/scripts/tests/test-changed-file-patterns.sh` asserts the
-/// pathspec behaviour against real git, and FileFilterTests asserts the predicate. Neither
+/// pathspec behaviour against real git, and FileFilterTests, which lives in the sibling
+/// Compliance.Unit.Tests project, asserts the predicate. Neither
 /// asserts that the two agree, and they do not: the pathspec token `*AssemblyInfo.cs` selects
 /// any file whose name ENDS with that string, while FileFilter.cs:24 requires the name to
 /// EQUAL it. A file in between is selected, counted into the skip decision, handed to the
@@ -20,9 +21,9 @@ using System.Diagnostics;
 /// These tests are written to PASS against today's behaviour. They record the disagreement so
 /// it is visible in the suite. Whether the fix narrows the pathspec or widens the filter is
 /// open: BHoMBot used EndsWith("AssemblyInfo.cs") (ProjectCompliance.cs:33), so widening the
-/// filter restores the older semantics, and FileFilterTests.cs:20 currently asserts the
-/// narrower one deliberately. Where an assertion would change under one of those two answers,
-/// the comment says what it should become and under which answer.
+/// filter restores the older semantics, and line 20 of that same FileFilterTests file asserts
+/// the narrower one deliberately. Where an assertion would change under one of those two
+/// answers, the comment says what it should become and under which answer.
 /// </summary>
 [TestFixture]
 [Category("Integration")]
