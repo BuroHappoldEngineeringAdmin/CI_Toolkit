@@ -12,16 +12,17 @@ using System.Diagnostics;
 ///
 /// Each half has tests. `.github/scripts/tests/test-changed-file-patterns.sh` asserts the
 /// pathspec behaviour against real git, and FileFilterTests asserts the predicate. Neither
-/// asserts that the two agree, and findings-register item 34b is that they do not: the
-/// pathspec token `*AssemblyInfo.cs` selects any file whose name ENDS with that string, while
-/// FileFilter.cs:24 requires the name to EQUAL it. A file in between is selected, counted into
-/// the skip decision, handed to the runner, and then silently discarded.
+/// asserts that the two agree, and they do not: the pathspec token `*AssemblyInfo.cs` selects
+/// any file whose name ENDS with that string, while FileFilter.cs:24 requires the name to
+/// EQUAL it. A file in between is selected, counted into the skip decision, handed to the
+/// runner, and then silently discarded.
 ///
 /// These tests are written to PASS against today's behaviour. They record the disagreement so
 /// it is visible in the suite. Whether the fix narrows the pathspec or widens the filter is
 /// open: BHoMBot used EndsWith("AssemblyInfo.cs") (ProjectCompliance.cs:33), so widening the
 /// filter restores the older semantics, and FileFilterTests.cs:20 currently asserts the
-/// narrower one deliberately. Marked INVERTS-ON-34b where a decision would change them.
+/// narrower one deliberately. Where an assertion would change under one of those two answers,
+/// the comment says what it should become and under which answer.
 /// </summary>
 [TestFixture]
 [Category("Integration")]
@@ -36,8 +37,8 @@ public class PathspecFilterPairingTests
     private const string StraddlingFile = "Properties/NotAssemblyInfo.cs";
 
     [Test]
-    [Description("ITEM 34b: the pathspec selects a file the filter then discards.")]
-    public void PathspecAndFilter_DisagreeOnAStraddlingName_ITEM34B()
+    [Description("The pathspec selects a file the filter then discards.")]
+    public void PathspecAndFilter_DisagreeOnAStraddlingName()
     {
         bool selectedByGit = GitDiffSelects(ProjectPathspec, StraddlingFile);
         bool acceptedByFilter = FileFilter.IsRelevantFile(StraddlingFile, "project");
@@ -50,18 +51,20 @@ public class PathspecFilterPairingTests
                 "git pathspec '*AssemblyInfo.cs' matches any path ending in that string. "
               + "'*' also matches '/', which is why the leading directory is no obstacle.");
 
-            // Half 2: the runner then drops it. INVERTS-ON-34b if the filter is widened to
-            // BHoMBot's EndsWith semantics.
+            // Half 2: the runner then drops it. Should become Is.True if the filter is widened
+            // to BHoMBot's EndsWith semantics; stays Is.False if the pathspec is narrowed
+            // instead, since then git would not select the file in the first place and the
+            // assertion above is the one that changes.
             Assert.That(acceptedByFilter, Is.False,
                 "FileFilter.cs:24 requires Path.GetFileName(file).Equals(\"AssemblyInfo.cs\"), "
               + "so the file is discarded with no message.");
 
             // The pairing, stated as the thing that is actually wrong.
             Assert.That(selectedByGit && !acceptedByFilter, Is.True,
-                "ITEM 34b (register). Both halves are individually tested and individually "
-              + "defensible; they disagree. A pull request changing only a file of this shape "
-              + "produces a green project-compliance check that examined nothing, which is "
-              + "item 3 reached by a route no single-layer test can see.");
+                "Both halves are individually tested and individually defensible; they "
+              + "disagree. A pull request changing only a file of this shape produces a green "
+              + "project-compliance check that examined nothing, reached by a route no "
+              + "single-layer test can see.");
         });
     }
 

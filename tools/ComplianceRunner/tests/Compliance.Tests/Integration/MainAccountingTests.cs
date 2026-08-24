@@ -4,13 +4,14 @@ using System.Text.Json;
 /// <summary>
 /// Characterisation tests for ComplianceRunner.Main's file accounting and exit code.
 ///
-/// These pin down what the entry point currently does when it examines nothing, which is
-/// findings-register item 3: the runner can report success having inspected no file at all.
-/// They are written to PASS against today's behaviour on purpose. The register item is
-/// Critical and blocked on decision Q3 (fail, warn, or fail only once a repo is gated), so
-/// this file records the behaviour rather than asserting a preferred one. Each assertion that
-/// is expected to invert once Q3 is answered is marked INVERTS-ON-Q3 with what it should
-/// become.
+/// These pin down what the entry point currently does when it examines nothing: the runner
+/// reports success having inspected no file at all. They are written to PASS against today's
+/// behaviour on purpose, so that a change to it shows up as a failing test rather than as a
+/// silent change in what a compliance check means.
+///
+/// Whether examining nothing should fail, warn, or stay as it is has not been decided. Where
+/// an assertion would change under a different answer, the comment says what it should become
+/// and under which answer, so nothing here has to be reverse-engineered later.
 ///
 /// Main cannot be unit-tested in-process: every branch of it compiles against BHoM types
 /// (TestResult, TestStatus, ITestInformation, BH.Engine.Test.CodeCompliance.Compute,
@@ -39,12 +40,12 @@ public class MainAccountingTests
         Assert.That(stdout, Does.Contain("[SKIP]"),
             "ComplianceRunner.cs:51 prints '  [SKIP] File not found: <file>' for a relevant "
           + "file that is not on disk. If this assertion fails the diagnostic has been removed "
-          + "or reworded, and item 3's only current signal has gone with it.");
+          + "or reworded, and with it the only signal that a file went unexamined.");
     }
 
     [Test]
-    [Description("ITEM 3: every relevant file being absent still exits 0 with status Pass.")]
-    public void AllRelevantFilesMissing_ExitsZeroWithPassStatus_ITEM3()
+    [Description("Every relevant file being absent still exits 0 with status Pass.")]
+    public void AllRelevantFilesMissing_ExitsZeroHavingExaminedNothing()
     {
         // Three files, all relevant to a code check, none on disk. Nothing is examined.
         var (exitCode, stdout) = RunnerFixture.Run("ComplianceRunner",
@@ -52,13 +53,13 @@ public class MainAccountingTests
 
         Assert.Multiple(() =>
         {
-            // INVERTS-ON-Q3: should become Is.EqualTo(1) if Q3 decides that examining
-            // nothing is a failure, or stay 0 with a ::warning if Q3 decides it warns.
+            // Should become Is.EqualTo(1) if examining nothing is later treated as a failure,
+            // or stay 0 with an added ::warning if it is treated as a warning instead.
             Assert.That(exitCode, Is.EqualTo(0),
-                "ITEM 3 (register, Critical). mergedResult.Status is initialised to Pass at "
-              + "ComplianceRunner.cs:39 and only ever changes via Merge inside the per-file "
-              + "loop. Every file skipping means the loop body never runs, so :162 returns 0. "
-              + "A compliance check therefore reports success having inspected nothing.");
+                "mergedResult.Status is initialised to Pass at ComplianceRunner.cs:39 and only "
+              + "ever changes via Merge inside the per-file loop. Every file skipping means the "
+              + "loop body never runs, so :162 returns 0. A compliance check therefore reports "
+              + "success having inspected nothing.");
 
             // No annotation is emitted either, so nothing in the GitHub log distinguishes
             // this from a genuine clean pass except the [SKIP] lines.
@@ -68,18 +69,20 @@ public class MainAccountingTests
     }
 
     [Test]
-    [Description("ITEM 3: the count of files actually examined is not reported anywhere.")]
-    public void ExaminedCount_IsNotReported_ITEM3()
+    [Description("The count of files actually examined is not reported anywhere.")]
+    public void ExaminedCount_IsNotReported()
     {
         // Contrast with VersioningRunner, which prints a Coverage line precisely so that a
         // pass over zero and a pass over thousands are distinguishable (RunCommand.cs:226-230).
-        // ComplianceRunner has no equivalent, which is why item 3 is invisible in the log.
+        // ComplianceRunner has no equivalent, so a pass that examined nothing is
+        // indistinguishable in the log from one that examined everything.
         var (_, stdout) = RunnerFixture.Run("ComplianceRunner",
             "code", "--output", "github", "a.cs", "b.cs", "c.cs");
 
         Assert.That(stdout, Does.Not.Contain("examined"),
-            "ITEM 3. There is no coverage line. Adding one is the cheapest partial mitigation "
-          + "and does not need Q3 answered, because reporting the number changes no verdict.");
+            "There is no coverage line. Adding one is the cheapest partial mitigation and does "
+          + "not depend on how the pass-versus-fail question is settled, because reporting the "
+          + "number changes no verdict.");
     }
 
     // ── Machine-readable output and the [SKIP] diagnostic ─────────────────────────────

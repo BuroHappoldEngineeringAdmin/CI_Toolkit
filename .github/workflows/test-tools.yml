@@ -75,7 +75,8 @@ jobs:
     name: ComplianceRunner tests
     runs-on: windows-latest
     # The hermetic job is 15. This one clones and builds Test_Toolkit's graph before it can
-    # compile anything, and the assembly cache is cold on a fresh branch (register item 28).
+    # compile anything, and the assembly cache is keyed per dependency SHA set, so it is cold
+    # the first time a branch resolves a new set and the whole graph is built from source.
     timeout-minutes: 45
     steps:
       - name: Checkout
