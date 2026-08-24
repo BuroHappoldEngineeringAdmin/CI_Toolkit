@@ -1,35 +1,43 @@
 # Resolve-DependencyGraph.BaselineReuse.Tests.ps1
 #
 # ci-serialisation invokes resolve-dependencies twice in one job: once for the pull request
-# branch and once for the base it is compared against. The second invocation reuses the first
-# invocation's clones without re-resolving them, so both legs are built against the BRANCH's
-# dependency code. A regression introduced on the dependency side then appears in both legs,
-# compares equal, and the check passes.
+# branch and once for the base it is compared against. Before this change the second invocation
+# reused the first invocation's clones without re-resolving them, so both legs were built against
+# the BRANCH's dependency code. A regression introduced on the dependency side then appeared in
+# both legs, compared equal, and the check passed.
 #
-# Written as a DEMONSTRATION, not a specification. Every assertion here describes what the
-# resolver does today. Fixing it is behaviour-changing and not yet scoped, so nothing here
-# asserts a preferred behaviour. Assertions expected to invert once it is fixed say so, and
-# name the value they should then read.
+# These began as a demonstration of that defect and are now the regression suite for its fix.
+# The assertions under "re-resolving an existing clone" and "reporting" originally asserted the
+# broken behaviour and have been inverted. The three preceding Contexts were controls and are
+# unchanged, which is what makes them useful: they show the fix did not alter resolution for
+# callers that invoke the action once, which is every check except ci-serialisation.
 #
-# Why a hermetic test rather than a live pair of repositories. Reproducing this end to end
-# needs a subject repo whose dependencies.txt names a dependency in the same organisation,
-# plus a branch of the same name on both. No such pair exists that is free to experiment on,
-# and making one would mean pushing branches to repositories that are in use. A local bare
-# repo reaches the same code path with no network.
+# This change does not make ci-serialisation a required check.
+#
+# Why a hermetic test rather than a live pair of repositories. Reproducing this end to end needs
+# a subject repo whose dependencies.txt names a dependency in the same organisation, plus a
+# branch of the same name on both. No such pair exists that is free to experiment on, and making
+# one would mean pushing branches to repositories that are in use. A local bare repo reaches the
+# same code path with no network.
 #
 # What it establishes, in order:
 #   1. On a fresh clone root, the resolver honours PR_BRANCH when that branch exists on the
-#      dependency (the intended cross-repo feature).
-#   2. Invoked a second time against the SAME clone root, it does not re-check-out anything,
-#      and records the same SHA. This is the "already cloned" path at
-#      Resolve-DependencyGraph.ps1:91 and it is what ci-serialisation's baseline leg hits.
-#   3. The resolver CAN land on the base branch when asked to, so the defect is not that it
-#      cannot; it is that ci-serialisation never asks. PR_BRANCH is sourced from
-#      github.event.pull_request.head.ref in resolve-dependencies/action.yml:132, which is
-#      constant for the whole job and has no per-invocation override.
-#   4. Even if a caller COULD ask for the base branch on the second invocation, the
-#      already-cloned shortcut would ignore it. Two independent causes, so a fix addressing
-#      only one of them does not work. This is the assertion that matters most.
+#      dependency. That is the intended cross-repo feature and the fix must not disturb it.
+#   2. Two invocations that both ask for the same ref agree: the checkout stays where it is and
+#      the recorded SHA does not change. A control on the always-re-resolve change, since an
+#      unstable repeat resolution would show up here first.
+#   3. The resolver can land on the base branch when asked to, so the defect was never that it
+#      could not. PR_BRANCH was taken from github.event.pull_request.head.ref in
+#      resolve-dependencies/action.yml, which is constant for a whole job and had no
+#      per-invocation override, so the baseline leg had no way to ask for anything else.
+#   4. An existing clone is re-resolved, so an explicit base-branch request is honoured, the
+#      working tree moves and not just the recorded SHA, and the two legs produce different
+#      cache-key inputs. These assertions originally read the other way round, which is what
+#      showed both causes had to be addressed together: adding the input alone would have been
+#      ignored by the shortcut that skipped resolution on an already-present clone.
+#   5. The selection table and the ref marker are written on every invocation, not only when a
+#      clone is created, and a repeat resolution is annotated according to who asked for the
+#      ref it settled on.
 #
 # Run locally:  pwsh -Command "Invoke-Pester .github/scripts/tests -Output Detailed"
 # Run in CI:    lint-workflows.yml, the powershell-tests job.
@@ -164,30 +172,27 @@ Describe 'resolve-dependencies: ref selection across repeat invocations in one j
         }
     }
 
-    Context 'a second invocation reuses the first invocation clone' {
+    Context 'a second invocation asking for the same ref is stable' {
 
-        It 'does not move the dependency off the branch tip on a second invocation' {
+        # Control, not a defect. Two invocations that both want the branch must agree. This
+        # guards the ordinary single-meaning case against the always-re-resolve change: if the
+        # fix had made repeat resolution unstable, this is what would catch it.
+        It 'stays on the branch tip when both invocations prefer the branch' {
             $ws   = New-Workspace -Name 'same-ref-ws'   -Dependency $dep
             $root = Join-Path $sandbox 'same-ref-clones'
 
-            # Branch leg.
             Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
-            $afterBranchLeg = Get-CheckedOutSha -CloneRoot $root -Name 'Dep'
+            $afterFirst = Get-CheckedOutSha -CloneRoot $root -Name 'Dep'
 
-            # Baseline leg. PR_BRANCH is unchanged because resolve-dependencies sources it
-            # from the event payload, which does not vary within a job. ci-serialisation
-            # clears ProgramData\BHoM\Assemblies between the legs but never the clone root,
-            # so this is what its second resolve sees.
             Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
-            $afterBaselineLeg = Get-CheckedOutSha -CloneRoot $root -Name 'Dep'
+            $afterSecond = Get-CheckedOutSha -CloneRoot $root -Name 'Dep'
 
-            $afterBranchLeg   | Should -Be $shas.Branch
-            # Should read $shas.Base once the baseline leg re-resolves; today it does not.
-            $afterBaselineLeg | Should -Be $shas.Branch
-            $afterBaselineLeg | Should -Be $afterBranchLeg
+            $afterFirst  | Should -Be $shas.Branch
+            $afterSecond | Should -Be $shas.Branch
+            $afterSecond | Should -Be $afterFirst
         }
 
-        It 'records the same SHA both times, so the assembly cache key is identical' {
+        It 'records the same SHA when both invocations prefer the same ref' {
             $ws   = New-Workspace -Name 'same-ref-sha-ws'   -Dependency $dep
             $root = Join-Path $sandbox 'same-ref-sha-clones'
 
@@ -197,14 +202,7 @@ Describe 'resolve-dependencies: ref selection across repeat invocations in one j
             Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
             $second = Get-RecordedSha -Workspace $ws -OwnerRepo $dep
 
-            # The depsasm- cache key is a SHA-256 over the sorted owner/repo@sha set
-            # (resolve-dependencies/action.yml:145-164). Identical recorded SHAs therefore
-            # mean an identical key, which is why the baseline leg restores the branch leg's
-            # assemblies instead of building its own: the key misses on the branch leg, which
-            # builds and saves it, then hits on the baseline leg, which clones nothing and
-            # builds nothing.
             $second | Should -Be $first
-            # Should read $shas.Base once the two legs resolve independently.
             $second | Should -Be $shas.Branch
         }
     }
@@ -236,26 +234,105 @@ Describe 'resolve-dependencies: ref selection across repeat invocations in one j
         }
     }
 
-    Context 'the two causes are independent' {
+    Context 're-resolving an existing clone, which is the fix' {
 
-        It 'ignores an explicit base-branch request when the clone is already present' {
+        # This is the assertion the whole change exists for. Before the fix it read
+        # Should -Be $shas.Branch: the already-cloned path short-circuited before any ref
+        # resolution, so an explicit base-branch request was ignored and parameterising the
+        # branch alone would not have helped. Both halves are now in place, so the second
+        # invocation lands where it was asked to.
+        It 'honours an explicit base-branch request when the clone is already present' {
             $ws   = New-Workspace -Name 'reresolve-ws'   -Dependency $dep
             $root = Join-Path $sandbox 'reresolve-clones'
 
-            # Branch leg, as normal.
             Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
             Get-CheckedOutSha -CloneRoot $root -Name 'Dep' | Should -Be $shas.Branch
 
-            # Now ask for the base branch on the second invocation, i.e. pretend the caller
-            # had been given the per-leg parameter it currently lacks. The already-cloned
-            # path at :91 short-circuits before any ref resolution, so the request is ignored.
+            # What ci-serialisation's baseline leg now does, via prefer_branch: base_ref.
             Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer 'develop' -Fallback 'develop'
 
-            # THE ASSERTION THAT MATTERS: adding a per-leg branch parameter alone would not
-            # fix this; the clone reuse has to be addressed too. Both of these should read
-            # $shas.Base once it is.
-            Get-CheckedOutSha -CloneRoot $root -Name 'Dep' | Should -Be $shas.Branch
-            Get-RecordedSha   -Workspace $ws  -OwnerRepo $dep | Should -Be $shas.Branch
+            Get-CheckedOutSha -CloneRoot $root -Name 'Dep'    | Should -Be $shas.Base
+            Get-RecordedSha   -Workspace $ws  -OwnerRepo $dep | Should -Be $shas.Base
+        }
+
+        It 'moves the working tree, not just the recorded SHA' {
+            $ws   = New-Workspace -Name 'reresolve-tree-ws'   -Dependency $dep
+            $root = Join-Path $sandbox 'reresolve-tree-clones'
+            $file = Join-Path (Join-Path $root 'Dep') 'Value.cs'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
+            (Get-Content $file -Raw) | Should -Match 'branch change'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer 'develop' -Fallback 'develop'
+
+            # Bookkeeping alone would leave the branch's source on disk and the base's SHA in
+            # _shas.txt, which is worse than the original defect: the cache key would say
+            # baseline while the assemblies were still built from branch code.
+            (Get-Content $file -Raw) | Should -Match 'base'
+            (Get-Content $file -Raw) | Should -Not -Match 'branch change'
+        }
+
+        It 'gives the two legs different cache-key inputs' {
+            $ws   = New-Workspace -Name 'reresolve-key-ws'   -Dependency $dep
+            $root = Join-Path $sandbox 'reresolve-key-clones'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
+            $branchLegSha = Get-RecordedSha -Workspace $ws -OwnerRepo $dep
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer 'develop' -Fallback 'develop'
+            $baselineLegSha = Get-RecordedSha -Workspace $ws -OwnerRepo $dep
+
+            # The depsasm- key is a SHA-256 over the sorted owner/repo@sha set
+            # (resolve-dependencies/action.yml). Differing recorded SHAs mean a differing key,
+            # so the baseline leg now misses the branch leg's assembly cache and builds its own
+            # closure. Identical SHAs across the legs were the observable signature of the
+            # defect: the key missed on the branch leg, which built and saved it, then hit on
+            # the baseline leg, which therefore restored the branch leg's assemblies rather
+            # than building its own.
+            $baselineLegSha | Should -Not -Be $branchLegSha
+        }
+    }
+
+    Context 'reporting: the resolved ref is recorded on every invocation' {
+
+        It 'writes a selection line on a reused clone, naming the ref it resolved to' {
+            $ws   = New-Workspace -Name 'rep-ws'   -Dependency $dep
+            $root = Join-Path $sandbox 'rep-clones'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer 'develop' -Fallback 'develop'
+
+            # _selection.txt is deleted at the start of every invocation, so this content is
+            # the second invocation's alone. It was empty before the reporting change, which
+            # is why the baseline leg's job summary had no dependency table.
+            $selection = Get-Content (Join-Path $ws 'deps/_selection.txt')
+            $selection | Should -Not -BeNullOrEmpty
+            ($selection -join "`n") | Should -Match ([regex]::Escape("$dep|Dep|develop|"))
+        }
+
+        It 'updates the marker so a later invocation reports the current ref' {
+            $ws   = New-Workspace -Name 'rep2-ws'   -Dependency $dep
+            $root = Join-Path $sandbox 'rep2-clones'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
+            $marker = Join-Path $root '_selected-refs.txt'
+            (Get-Content $marker -Raw) | Should -Match ([regex]::Escape("Dep|$prefer"))
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer 'develop' -Fallback 'develop'
+            (Get-Content $marker -Raw) | Should -Match ([regex]::Escape('Dep|develop'))
+            (Get-Content $marker -Raw) | Should -Not -Match ([regex]::Escape($prefer))
+        }
+
+        It 'keeps the marker file out of the directories the caller junctions' {
+            $ws   = New-Workspace -Name 'rep3-ws'   -Dependency $dep
+            $root = Join-Path $sandbox 'rep3-clones'
+
+            Invoke-Resolver -Workspace $ws -CloneRoot $root -Prefer $prefer -Fallback 'develop'
+
+            # The calling action junctions every DIRECTORY under the clone root into the
+            # workspace parent. A marker stored as a directory would be linked in as though it
+            # were a dependency.
+            Get-ChildItem $root -Directory | ForEach-Object { $_.Name } | Should -Be @('Dep')
         }
     }
 }
