@@ -196,7 +196,10 @@ runs:
       run: |
         git fetch origin ${{ inputs.base_ref }}
         git checkout ${{ inputs.base_ref }}
-        Remove-Item "C:\ProgramData\BHoM\Assemblies\*" -Recurse -Force -ErrorAction SilentlyContinue
+        # No assemblies reset here. resolve-dependencies removes and recreates both
+        # ProgramData\BHoM\Assemblies and ProgramData\BHoM\Upgrades in its own Prepare
+        # folders step, which is the next step and runs unconditionally. A reset here
+        # would cover one of those two directories and be redundant with the step after it.
 
     # prefer_branch is what makes this a baseline. Without it the head branch is preferred on
     # both legs, because resolve-dependencies takes PR_BRANCH from the event payload and that
@@ -223,7 +226,10 @@ runs:
       shell: pwsh
       run: |
         dotnet restore "${{ steps.solution.outputs.path }}"
-        dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m
+        # -clp:ErrorsOnly for the same reason as the branch leg above, and with more force:
+        # this compiles the base branch, so every warning belongs to code the author did
+        # not write and cannot act on.
+        dotnet build "${{ steps.solution.outputs.path }}" --no-restore -c Release --nologo -m -clp:ErrorsOnly
 
     # Re-infer against the baseline checkout: Verification.sln may declare
     # different Release variants on branch versus base (e.g. the branch
@@ -240,7 +246,7 @@ runs:
       shell: pwsh
       run: |
         dotnet restore "${{ steps.ver_sln.outputs.path }}"
-        dotnet build "${{ steps.ver_sln.outputs.path }}" --no-restore -c ${{ steps.ver_config_baseline.outputs.config }} --nologo
+        dotnet build "${{ steps.ver_sln.outputs.path }}" --no-restore -c ${{ steps.ver_config_baseline.outputs.config }} --nologo -clp:ErrorsOnly
 
     # --- Comparison ---
 
@@ -266,83 +272,51 @@ runs:
         "verdict=$verdict" | Out-File $env:GITHUB_OUTPUT -Append
         if ($code -ne 0) { exit $code }
 
-    # Distinguish an infrastructure failure from a serialisation regression. A
-    # dependency build failure otherwise shows as a red serialisation check with no
-    # indication that serialisation never ran.
-    - name: Write to Job Summary (did not run)
-      if: always() && steps.changed.outputs.count != '0' && (steps.deps_branch.conclusion == 'failure' || steps.build_branch.conclusion == 'failure')
+    # One summary step, reached on every path.
+    #
+    # This was five steps, each gated on its own combination of step conclusions and outputs.
+    # The conditions had to enumerate the states worth reporting, and between them they named
+    # five of this action's eighteen functional steps, so a failure anywhere else matched no
+    # condition and the check went red with an empty summary. Seven of the unnamed steps run
+    # before serialisation is attempted, which is the case a reader is least able to diagnose.
+    #
+    # The decision moved to a script so it can be tested without running a serialisation check,
+    # and so the branch that handles "none of the above" is a branch in code rather than a
+    # condition nobody wrote.
+    #
+    # Values go through env: rather than into the script arguments, so a step output cannot be
+    # interpolated into a command line.
+    - name: Write to Job Summary
+      if: always() && steps.changed.outputs.count != '0'
       shell: pwsh
+      env:
+        DEPS_BRANCH_CONCLUSION:  ${{ steps.deps_branch.conclusion }}
+        BUILD_BRANCH_CONCLUSION: ${{ steps.build_branch.conclusion }}
+        BRANCH_RUN_CONCLUSION:   ${{ steps.branch_run.conclusion }}
+        BRANCH_STATUS:           ${{ steps.branch_run.outputs.status }}
+        COMPARE_VERDICT:         ${{ steps.compare.outputs.verdict }}
+        POPULATION:              ${{ steps.branch_run.outputs.population }}
+        ASSEMBLIES:              ${{ steps.branch_run.outputs.assemblies }}
+        LEGS:                    ${{ steps.branch_run.outputs.legs }}
+        FAILURES:                ${{ steps.branch_run.outputs.failures }}
       run: |
-        $step = if ("${{ steps.deps_branch.conclusion }}" -eq 'failure') { 'Resolve dependencies (branch)' } else { 'Build primary repo (branch)' }
-        @(
-          "### Serialisation did not run"
-          ""
-          "Failed in: $step"
-          ""
-          "The dependency closure did not build, so no serialisation comparison was made."
-          "This is not a serialisation finding. See the ci-build check on this pull request"
-          "for the same failure."
-        ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        # GITHUB_ACTION_PATH is .github/actions/ci-serialisation, so ../../scripts is
+        # .github/scripts, the same path ci-build and ci-versioning use for shared scripts.
+        $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Write-SerialisationSummary.ps1"
+        . $script
 
-    - name: Write to Job Summary (branch passed)
-      if: always() && steps.changed.outputs.count != '0' && steps.branch_run.conclusion == 'success' && steps.branch_run.outputs.status != 'Error'
-      shell: pwsh
-      run: |
-        @(
-          "### Serialisation"
-          ""
-          "| Status |"
-          "|---|"
-          "| No serialisation failures (${{ steps.branch_run.outputs.status }}) |"
-          ""
-          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
-          ""
-                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        $lines = Get-SerialisationSummary `
+          -DepsBranchConclusion  $env:DEPS_BRANCH_CONCLUSION `
+          -BuildBranchConclusion $env:BUILD_BRANCH_CONCLUSION `
+          -BranchRunConclusion   $env:BRANCH_RUN_CONCLUSION `
+          -BranchStatus          $env:BRANCH_STATUS `
+          -CompareVerdict        $env:COMPARE_VERDICT `
+          -Population            $env:POPULATION `
+          -Assemblies            $env:ASSEMBLIES `
+          -Legs                  $env:LEGS `
+          -Failures              $env:FAILURES
 
-    - name: Write to Job Summary (pre-existing failures)
-      if: always() && steps.changed.outputs.count != '0' && steps.compare.outputs.verdict == 'ok'
-      shell: pwsh
-      run: |
-        @(
-          "### Serialisation"
-          ""
-          "| Status |"
-          "|---|"
-          "| Serialisation failures detected. All are pre-existing on the base branch, so this job passes. |"
-          ""
-          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
-          ""
-                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-    - name: Write to Job Summary (regression detected)
-      if: always() && steps.changed.outputs.count != '0' && steps.compare.outputs.verdict == 'regression'
-      shell: pwsh
-      run: |
-        @(
-          "### Serialisation"
-          ""
-          "| Status |"
-          "|---|"
-          "| Serialisation regression detected. Affected types are in the step log. |"
-          ""
-          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
-          ""
-                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-    - name: Write to Job Summary (serialisation unverifiable)
-      if: always() && steps.changed.outputs.count != '0' && (steps.branch_run.conclusion == 'failure' || steps.compare.outputs.verdict == 'baseline-unusable')
-      shell: pwsh
-      run: |
-        @(
-          "### Serialisation"
-          ""
-          "| Status |"
-          "|---|"
-          "| Serialisation could not be verified. This is a CI runner failure, not a defect in this pull request. |"
-          ""
-          "Objects exercised: ${{ steps.branch_run.outputs.population }} across ${{ steps.branch_run.outputs.assemblies }} loaded assemblies, ${{ steps.branch_run.outputs.legs }} legs. Failures reported by the runner: ${{ steps.branch_run.outputs.failures }}."
-          ""
-                  ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        $lines | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
     - name: Upload results
       if: always() && steps.changed.outputs.count != '0'
