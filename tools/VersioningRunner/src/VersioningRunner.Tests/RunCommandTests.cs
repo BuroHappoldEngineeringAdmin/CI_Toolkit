@@ -365,6 +365,11 @@ namespace VersioningRunner.Tests
         }
     }
 
+    // IsFromSubjectNamespace is no longer the attribution mechanism. It is the fallback used
+    // only when a failure records no declaring assembly, because the description alone cannot
+    // say whether its last segment is a type or a method and so cannot separate a repository's
+    // own types from those of repositories extending its namespace. These cases still hold for
+    // what the function does; SubjectAttributionDecisionTests covers which one gets consulted.
     public class SubjectAttributionTests
     {
         private static HashSet<string> Namespaces(params string[] ns) =>
@@ -428,76 +433,86 @@ namespace VersioningRunner.Tests
         }
 
         [Fact]
-        public void NoSubjectDirSupplied_FallsBackToWholeClosure()
+        public void NoSubjectListSupplied_FallsBackToWholeClosure()
         {
+            Assert.Null(RunCommand.ReadSubjectAssemblyList(null));
+            Assert.Null(RunCommand.ReadSubjectAssemblyList("   "));
             Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], null));
-            Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], "   "));
         }
 
         [Fact]
-        public void MissingSubjectDir_FallsBackToWholeClosure()
+        public void MissingSubjectList_FallsBackToWholeClosure()
         {
-            string missing = Path.Combine(Path.GetTempPath(), "versioning-runner-no-such-dir-" + Guid.NewGuid());
-            Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], missing));
+            string missing = Path.Combine(Path.GetTempPath(), "versioning-runner-no-such-list-" + Guid.NewGuid());
+            Assert.Null(RunCommand.ReadSubjectAssemblyList(missing));
         }
 
         [Fact]
-        public void SubjectDirNamingALoadedAssembly_YieldsThatAssemblysNamespaces()
+        public void EmptySubjectList_IsNotTheSameAsNoList()
+        {
+            // Null means nobody said which assemblies are the subject's, so attribution widens
+            // to the whole closure. Empty means the caller looked and the build staged nothing,
+            // which the caller fails on before this point. Collapsing the two would turn a
+            // build failure into a silent whole-closure report.
+            string list = Path.Combine(Path.GetTempPath(), "versioning-runner-list-" + Guid.NewGuid() + ".txt");
+            File.WriteAllText(list, "");
+            try
+            {
+                var names = RunCommand.ReadSubjectAssemblyList(list);
+
+                Assert.NotNull(names);
+                Assert.Empty(names!);
+            }
+            finally { File.Delete(list); }
+        }
+
+        [Fact]
+        public void SubjectListNamingALoadedAssembly_YieldsThatAssemblysNamespaces()
         {
             var asm = typeof(object).Assembly;
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            Directory.CreateDirectory(dir);
-            try
-            {
-                // Only the file name is used; the content is never loaded, because the
-                // namespaces come off the already-loaded assembly of the same name.
-                File.WriteAllText(Path.Combine(dir, Path.GetFileName(asm.Location)), "");
+            var names = RunCommand.ReadSubjectAssemblyListFrom([Path.GetFileName(asm.Location)]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([asm], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Contains("System.Collections.Generic", ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.Contains("System.Collections.Generic", ns);
         }
 
         [Fact]
-        public void SubjectAssemblyInATfmSubdirectory_IsFound()
+        public void SubjectListEntriesMayBeFullPaths()
         {
-            // SDK-style repos append the TFM to OutputPath, so the subject's assemblies sit
-            // in Build\<tfm>\ rather than Build\. A top-level-only scan silently produced an
-            // empty subject set, and an empty set means the check cannot fail.
+            // The caller writes names, but a full path is the obvious thing for someone to
+            // write later, and silently matching nothing would empty the subject set.
             var asm = typeof(object).Assembly;
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            string nested = Path.Combine(dir, "netstandard2.0");
-            Directory.CreateDirectory(nested);
-            try
-            {
-                File.WriteAllText(Path.Combine(nested, Path.GetFileName(asm.Location)), "");
+            var names = RunCommand.ReadSubjectAssemblyListFrom([asm.Location]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([asm], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Contains("System.Collections.Generic", ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.Contains("System.Collections.Generic", ns);
         }
 
         [Fact]
-        public void SubjectDirNamingNothingLoaded_YieldsNoNamespacesRatherThanTheClosure()
+        public void SubjectListIsCaseInsensitive()
         {
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            Directory.CreateDirectory(dir);
-            try
-            {
-                File.WriteAllText(Path.Combine(dir, "Nothing_Built_Here.dll"), "");
+            var asm = typeof(object).Assembly;
+            var names = RunCommand.ReadSubjectAssemblyListFrom([Path.GetFileName(asm.Location).ToUpperInvariant()]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Empty(ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.NotEmpty(ns!);
+        }
+
+        [Fact]
+        public void SubjectListNamingNothingLoaded_YieldsNoNamespacesRatherThanTheClosure()
+        {
+            var names = RunCommand.ReadSubjectAssemblyListFrom(["Nothing_Built_Here.dll"]);
+
+            var ns = RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], names);
+
+            Assert.NotNull(ns);
+            Assert.Empty(ns);
         }
 
         // Strings below are copied verbatim from a real run's EventMessages.
@@ -554,7 +569,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips);
 
             Assert.Equal(VersioningStatus.Pass, result.Status);
             Assert.Equal(0, result.FailureCount);
@@ -579,7 +594,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips);
 
             Assert.Equal(VersioningStatus.Error, result.Status);
             Assert.Equal(1, result.FailureCount);
@@ -637,7 +652,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips,
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips,
                 probeSignature: (_, _, _) => ("Autodesk.Revit.DB.LogicalOrFilter", ClassificationPath.SignatureBlockerOutsideBHoM, Array.Empty<string>()));
 
             Assert.Equal(0, result.FailureCount);
@@ -665,7 +680,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             // Probe finds no blocker, so this stays a real failure — but actionable.
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.Revit.Engine.MechanicalPlumbing.Create.SomethingGenuine",
@@ -687,7 +702,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leaf] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.oM.Adapters.File.FileSettings", result.Failures[0].Description);
@@ -706,7 +721,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leaf] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.oM.Adapters.File.FileSettings", result.Failures[0].Description);
@@ -725,11 +740,11 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var subject = Namespaces("BH.oM.Adapters.File");
-            var filtered = RunCommand.ExtractFilteredResult(outer, d => RunCommand.IsFromSubjectNamespace(d, subject));
+            var filtered = RunCommand.ExtractFilteredResult(outer, (d, _) => (RunCommand.IsFromSubjectNamespace(d, subject), AttributionBasis.NamespaceFallback));
             Assert.Equal(VersioningStatus.Pass, filtered.Status);
             Assert.Equal(0, filtered.FailureCount);
 
-            var kept = RunCommand.ExtractFilteredResult(outer, _ => true);
+            var kept = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded));
             Assert.Equal(VersioningStatus.Error, kept.Status);
             Assert.Equal(1, kept.FailureCount);
         }
@@ -763,7 +778,7 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             RunCommand.ExtractFilteredResult(Tree("BH.oM.Adapters.File.FileSettings", RevitCause),
-                _ => true, null, null, diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, null, diagnostics);
 
             var only = Assert.Single(diagnostics);
             Assert.False(only.CountedAsReal);
@@ -778,7 +793,7 @@ namespace VersioningRunner.Tests
             // real by default rather than by evidence.
             var diagnostics = new List<FailureDiagnostic>();
             var result = RunCommand.ExtractFilteredResult(Tree("BH.oM.Adapters.File.FileSettings"),
-                _ => true, null, (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()), diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()), diagnostics);
 
             Assert.Equal(1, result.FailureCount);
             var only = Assert.Single(diagnostics);
@@ -792,7 +807,7 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             RunCommand.ExtractFilteredResult(Tree("BH.Revit.Engine.MechanicalPlumbing.Compute. }", MethodCause),
-                _ => true, null, (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()), diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()), diagnostics);
 
             var only = Assert.Single(diagnostics);
             Assert.True(only.CountedAsReal);
@@ -809,7 +824,7 @@ namespace VersioningRunner.Tests
             string? seen = "not called";
             RunCommand.ExtractFilteredResult(
                 Tree("BH.Revit.Engine.MechanicalPlumbing.Compute. }", MethodCause),
-                _ => true, null,
+                (_, _) => (true, AttributionBasis.NotRecorded), null,
                 (_, _, asm) => { seen = asm; return (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()); },
                 null);
 
@@ -834,7 +849,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leafReal, leafUnverified] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips, null, diagnostics);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips, null, diagnostics);
 
             Assert.Equal(1, result.FailureCount);
             Assert.Single(skips);

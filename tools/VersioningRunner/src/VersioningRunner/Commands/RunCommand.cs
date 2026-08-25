@@ -14,7 +14,7 @@ public static class RunCommand
         string assembliesPath,
         string? outputPath,
         bool testAll,
-        string? subjectBuildDir = null,
+        string? subjectAssemblyList = null,
         string? configuration = null,
         IReadOnlyCollection<string>? versionConditionalMethods = null)
     {
@@ -63,30 +63,39 @@ public static class RunCommand
         // assembly correctly. Null when no subject build dir was supplied: with whole-closure
         // attribution there is no basis for calling any assembly foreign, so the
         // reclassification is disabled and the fail-safe default stands.
+        HashSet<string>? subjectFileNames = ReadSubjectAssemblyList(subjectAssemblyList);
+
         ClosureContext? closure = null;
-        if (subjectBuildDir is not null && Directory.Exists(subjectBuildDir))
+        if (subjectFileNames is { Count: > 0 })
         {
             var loadedNames = new HashSet<string>(
                 loaded.Select(a => { try { return a.GetName().Name; } catch { return null; } })
                       .Where(n => !string.IsNullOrEmpty(n))!,
                 StringComparer.Ordinal);
             var subjectBases = new HashSet<string>(
-                Directory.GetFiles(subjectBuildDir, "*.dll", SearchOption.AllDirectories)
-                         .Select(f => StripConfigSuffix(Path.GetFileNameWithoutExtension(f))),
+                subjectFileNames.Select(f => StripConfigSuffix(Path.GetFileNameWithoutExtension(f))),
                 StringComparer.Ordinal);
-            if (subjectBases.Count > 0)
-                closure = new ClosureContext(
-                    loadedNames,
-                    new HashSet<string>(loadedNames.Select(StripConfigSuffix), StringComparer.Ordinal),
-                    subjectBases);
+            closure = new ClosureContext(
+                loadedNames,
+                new HashSet<string>(loadedNames.Select(StripConfigSuffix), StringComparer.Ordinal),
+                subjectBases);
         }
 
-        var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectBuildDir);
-        Func<string, bool> isAttributable;
+        var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectFileNames);
+
+        // Attribution answers "is this failure ours"; classification answers "is it real".
+        // Those are separate questions and this is the place the first one is answered, which
+        // is why the declaring assembly is taken into account here rather than being used to
+        // repair a foreign finding further down. The reclassification at the bottom of
+        // CollectLeafFailures deliberately refuses to touch a finding nothing answered for,
+        // because doing so would turn a genuine removal into a silent pass; that guard is
+        // correct and stays. A failure whose declaring assembly is another repository's was
+        // never ours to classify in the first place.
+        Func<string, string?, (bool Attributable, AttributionBasis Basis)> isAttributable;
         if (subjectNamespaces is null)
         {
             Console.WriteLine($"Attribution: whole closure, {nsPrefixes.Count} namespace prefix(es)");
-            isAttributable = d => IsFromLoadedNamespace(d, nsPrefixes);
+            isAttributable = (d, _) => (IsFromLoadedNamespace(d, nsPrefixes), AttributionBasis.NotRecorded);
         }
         else
         {
@@ -108,7 +117,8 @@ public static class RunCommand
                     ? " — nothing to attribute to this repo, so no failure can be reported"
                     : $": {string.Join(", ", subjectNamespaces.OrderBy(x => x, StringComparer.Ordinal).Take(20))}"));
             var subject = subjectNamespaces;
-            isAttributable = d => IsFromSubjectNamespace(d, subject);
+            var ctx = closure;
+            isAttributable = (d, asm) => AttributeToSubject(d, asm, subject, ctx);
         }
 
         var allFailures = new List<FailureInfo>();
@@ -173,6 +183,31 @@ public static class RunCommand
             int noAssembly = diagnostics.Count(d => d.CountedAsReal && d.DeclaringAssembly is null);
             if (noAssembly > 0)
                 Console.WriteLine($"Real failures with no declaring assembly recorded: {noAssembly}");
+
+            // How each attributed failure was decided to be ours. Reported unconditionally
+            // because the interesting number is the fallback count, and a number that is only
+            // printed when it is non-zero cannot be distinguished from one nobody measured.
+            int byAssembly = diagnostics.Count(d => d.AttributedBy == AttributionBasis.DeclaringAssembly);
+            int byNamespace = diagnostics.Count(d => d.AttributedBy == AttributionBasis.NamespaceFallback);
+            if (byAssembly + byNamespace > 0)
+            {
+                Console.WriteLine(
+                    $"Attribution basis: {byAssembly} by declaring assembly, "
+                    + $"{byNamespace} by namespace fallback (no declaring assembly recorded)");
+
+                // The fallback cannot tell this repository's namespace from a namespace it is
+                // merely the root of, so any finding on that path may be another repository's.
+                // Warned rather than logged: it is the residue of a known defect, and the
+                // point of counting it is that someone notices when it stops being zero.
+                if (byNamespace > 0)
+                {
+                    Console.Error.WriteLine(
+                        $"::warning title=Versioning::{byNamespace} failure(s) were attributed to this repository by "
+                        + "namespace because the dataset record named no declaring assembly. That test cannot separate "
+                        + "this repository's types from those of repositories extending its namespace, so these "
+                        + "specific findings may not be its own.");
+                }
+            }
         }
 
         if (infrastructureSkips.Count > 0)
@@ -390,11 +425,14 @@ public static class RunCommand
     public static VersioningResult ExtractFilteredResult(object? rawResult, List<Assembly> loaded)
     {
         var nsPrefixes = BuildNamespacePrefixes(loaded);
-        return ExtractFilteredResult(rawResult, d => IsFromLoadedNamespace(d, nsPrefixes));
+        return ExtractFilteredResult(
+            rawResult, (d, _) => (IsFromLoadedNamespace(d, nsPrefixes), AttributionBasis.NotRecorded));
     }
 
     public static VersioningResult ExtractFilteredResult(
-        object? rawResult, Func<string, bool> isAttributable, List<UnverifiedFailure>? unresolvableSkips = null,
+        object? rawResult,
+        Func<string, string?, (bool Attributable, AttributionBasis Basis)> isAttributable,
+        List<UnverifiedFailure>? unresolvableSkips = null,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature = null,
         List<FailureDiagnostic>? diagnostics = null,
         ClosureContext? closure = null)
@@ -421,7 +459,8 @@ public static class RunCommand
     }
 
     private static void CollectLeafFailures(
-        object node, Func<string, bool> isAttributable, List<FailureInfo> failures,
+        object node, Func<string, string?, (bool Attributable, AttributionBasis Basis)> isAttributable,
+        List<FailureInfo> failures,
         List<UnverifiedFailure>? unresolvableSkips,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature,
         List<FailureDiagnostic>? diagnostics, ClosureContext? closure, int depth)
@@ -457,13 +496,28 @@ public static class RunCommand
             string desc = nodeType.GetProperty("Description")?.GetValue(node)?.ToString() ?? "";
             string msg  = nodeType.GetProperty("Message")?.GetValue(node)?.ToString() ?? "";
 
-            if (!isAttributable(desc))
-                return;
-
             // allChildren are all EventMessages here, since resultChildren is empty.
             var eventMessages = allChildren
                 .Select(c => c.GetType().GetProperty("Message")?.GetValue(c)?.ToString() ?? "")
                 .ToList();
+
+            // The Method event's "Name" is assembly-qualified. It is the only handle on which
+            // assembly should declare the type, so it decides who gets asked when the type
+            // cannot be resolved, and it is also the only unambiguous answer to whether this
+            // failure is ours at all.
+            //
+            // Read before the attribution decision, not after. It used to be read after, so
+            // attribution was settled on the description alone while this sat four lines below
+            // unused: a repository declaring a namespace others extend was attributed all of
+            // their failures. The events are already in hand at this point, so reading them
+            // first costs nothing.
+            string? declaringAssembly = eventMessages
+                .Select(ParseMethodEventAssembly)
+                .FirstOrDefault(a => a is not null);
+
+            var (attributable, attributedBy) = isAttributable(desc, declaringAssembly);
+            if (!attributable)
+                return;
 
             // DescriptionFromJson mangles many method entries to "<DeclaringType>. }",
             // losing the method name. The Method event still carries both, so prefer it.
@@ -473,13 +527,6 @@ public static class RunCommand
             string label = eventType is not null && eventMethod is not null && desc.EndsWith(". }", StringComparison.Ordinal)
                 ? $"{eventType}.{eventMethod}"
                 : desc;
-
-            // The Method event's "Name" is assembly-qualified. It is the only handle on which
-            // assembly should declare the type, so it decides who gets asked when the type
-            // cannot be resolved.
-            string? declaringAssembly = eventMessages
-                .Select(ParseMethodEventAssembly)
-                .FirstOrDefault(a => a is not null);
 
             string? cause = ClassifyUnresolvableCause(eventMessages);
             var path = ClassificationPath.UnresolvableFromEvents;
@@ -541,7 +588,8 @@ public static class RunCommand
                 // the ordinary case and carrying it would add noise to every row.
                 DeclaringTypeCandidates: candidates.Count > 1 ? candidates : null,
                 Configuration: s_configuration,
-                VersionConditional: ClassifyVersionConditional(eventType, eventMethod)));
+                VersionConditional: ClassifyVersionConditional(eventType, eventMethod),
+                AttributedBy: attributedBy));
         }
         else
         {
@@ -586,29 +634,56 @@ public static class RunCommand
     // whole-closure behaviour). Names come off the build output but are resolved against
     // the loaded set, which is authoritative, so a stale Build\ entry cannot introduce a
     // namespace for an assembly that is not actually present.
-    internal static HashSet<string>? BuildSubjectNamespaces(List<Assembly> loaded, string? subjectBuildDir)
+
+    // The subject set is the assemblies this repository's own build staged, handed over as a
+    // list the caller computed rather than a directory this reads.
+    //
+    // It used to be a directory, `<workspace>\Build`, which the caller assumed every project
+    // wrote to. Nothing guaranteed that: the convention was enforced by a linter that only
+    // rewrote OutputPath values already present and never inspected which configuration they
+    // applied to, and no check read the directory until this one. Measured across 138 projects,
+    // 30% did not write there under the configuration CI builds, and a different 35% would not
+    // under the other one. So there was no configuration that made it reliable.
+    //
+    // A list has a property the directory did not: it describes what happened rather than what
+    // was declared. It also cannot be partially right. A directory holding some of the
+    // repository's assemblies produced a subject set that looked plausible and silently covered
+    // a fraction of the repo, with nothing to indicate it.
+    //
+    // Null means no list was supplied and attribution falls back to the whole closure, which
+    // over-reports. Empty means the list was supplied and the build staged nothing, which is a
+    // different state and is warned about by the caller before this runs.
+    // Split from the file read so the name handling can be tested without a temp file.
+    internal static HashSet<string> ReadSubjectAssemblyListFrom(IEnumerable<string> entries) =>
+        new(entries.Select(l => l.Trim())
+                   .Where(l => l.Length > 0)
+                   .Select(Path.GetFileName)
+                   .Where(n => !string.IsNullOrEmpty(n))!,
+            StringComparer.OrdinalIgnoreCase);
+
+    internal static HashSet<string>? ReadSubjectAssemblyList(string? listPath)
     {
-        if (string.IsNullOrWhiteSpace(subjectBuildDir))
+        if (string.IsNullOrWhiteSpace(listPath))
             return null;
 
-        if (!Directory.Exists(subjectBuildDir))
+        if (!File.Exists(listPath))
         {
             Console.Error.WriteLine(
-                $"::warning title=Versioning::Subject build directory '{subjectBuildDir}' not found. " +
+                $"::warning title=Versioning::Subject assembly list '{listPath}' not found. " +
                 "Falling back to attributing failures across the whole dependency closure, " +
                 "which over-reports: failures owned by dependencies will be attributed to this repo.");
             return null;
         }
 
-        // Recursive because the layout under Build\ varies by project style, measured:
-        // SDK-style repos append the TFM (File_Toolkit -> Build\netstandard2.0\File_oM.dll)
-        // while the old-style Revit projects are flat (Build\Revit_X_oM_2022.dll). A
-        // top-level scan finds nothing for the former, which silently empties the subject
-        // set. Safe to recurse: BHoM references carry <Private>False</Private>, so a
-        // dependency's DLL is never copied into the subject's output.
-        var subjectFiles = new HashSet<string>(
-            Directory.GetFiles(subjectBuildDir, "*.dll", SearchOption.AllDirectories).Select(Path.GetFileName)!,
-            StringComparer.OrdinalIgnoreCase);
+        // Names, not paths. Callers may write either; the comparison downstream is by file
+        // name, because that is what identifies an assembly in the staged set.
+        return ReadSubjectAssemblyListFrom(File.ReadAllLines(listPath));
+    }
+
+    internal static HashSet<string>? BuildSubjectNamespaces(List<Assembly> loaded, HashSet<string>? subjectFiles)
+    {
+        if (subjectFiles is null)
+            return null;
 
         var namespaces = new HashSet<string>(StringComparer.Ordinal);
         int unreadable = 0;
@@ -672,7 +747,7 @@ public static class RunCommand
         s_subjectTypeCount = subjectTypeCount;
 
         Console.WriteLine(
-            $"Subject assemblies: {subjectFiles.Count} name(s) in {subjectBuildDir}, " +
+            $"Subject assemblies: {subjectFiles.Count} name(s) staged by the subject build, " +
             $"{subjectFiles.Count(f => loaded.Any(a => PathName(a) == f))} present in the loaded set");
         return namespaces;
 
@@ -697,12 +772,59 @@ public static class RunCommand
         return nsPrefixes.Contains(parts[0] + "." + parts[1] + "." + parts[2]);
     }
 
-    // Attribution against exact namespaces. A failure belongs to the subject when its
-    // declaring type sits in one of the subject's namespaces or below it. Matching on a
-    // segment boundary keeps BH.oM.Adapters.ETABS.Pier out when the subject only declares
-    // BH.oM.Adapters.File. Descriptions arrive either as a type full name or as
-    // "DeclaringType.MethodName" (Versioning_Toolkit's DescriptionFromJson), and both are
-    // covered: each is a strict prefix extension of the declaring namespace.
+    // The whole attribution decision for subject mode, in one place so that what the runner
+    // does and what the tests check cannot drift apart.
+    //
+    // The declaring assembly wins whenever there is one, including when it says no: an
+    // assembly that is not the subject's is a definite answer, and falling through to the
+    // namespace after it would reinstate the defect this exists to remove. The namespace is
+    // consulted only in the absence of an assembly, where it is the sole evidence available.
+    public static (bool Attributable, AttributionBasis Basis) AttributeToSubject(
+        string description, string? declaringAssembly,
+        HashSet<string> subjectNamespaces, ClosureContext? closure)
+    {
+        if (declaringAssembly is not null)
+            return (IsFromSubjectAssembly(declaringAssembly, closure), AttributionBasis.DeclaringAssembly);
+
+        // No assembly recorded, so the ambiguous string is all there is. Kept rather than
+        // dropped: a silent drop would lose a real regression. Counted by the caller so the
+        // size of this path is measured rather than assumed.
+        return (IsFromSubjectNamespace(description, subjectNamespaces), AttributionBasis.NamespaceFallback);
+    }
+
+    // Attribution against the assembly the dataset record names. This is the primary test and
+    // the only unambiguous one: the subject either staged an assembly of that name or it did
+    // not, and no string parsing is involved.
+    //
+    // It works precisely where the namespace cannot. The failures this was written for are
+    // classified DeclaringTypeNotLoaded, meaning no loaded assembly yielded the type and the
+    // one the event named is outside the closure. Their namespaces are therefore absent from
+    // every loaded set, so no scheme that reasons about which namespace is the longest match
+    // can see them. The assembly name comes from the record, not from loading, so it is
+    // available exactly when the type is not.
+    //
+    // Compared on the config-stripped base name because Revit repositories build the same
+    // assembly per year (Revit_Core_Engine_2022 and _2024 are one assembly to the subject),
+    // reusing the closure's own normalisation so the two cannot disagree.
+    public static bool IsFromSubjectAssembly(string? declaringAssembly, ClosureContext? closure)
+    {
+        // No closure means no subject set was established, so nothing can be called ours.
+        if (string.IsNullOrWhiteSpace(declaringAssembly) || closure is null)
+            return false;
+
+        return closure.SubjectBaseNames.Contains(StripConfigSuffix(declaringAssembly));
+    }
+
+    // Attribution against exact namespaces. Used only when no declaring assembly was
+    // recorded, because it cannot be made correct: a failure belongs to the subject when its
+    // declaring type sits in one of the subject's namespaces or below it, and "or below it"
+    // is exactly what over-attributes. Matching on a segment boundary keeps
+    // BH.oM.Adapters.ETABS.Pier out when the subject only declares BH.oM.Adapters.File, but
+    // nothing here can keep BH.Adapter.ETABS.ETABSAdapter out when the subject declares
+    // BH.Adapter, because the string does not say whether the last segment is a type or a
+    // method. Descriptions arrive either as a type full name or as "DeclaringType.MethodName"
+    // (Versioning_Toolkit's DescriptionFromJson), and both are strict prefix extensions of
+    // the declaring namespace, which is why this is a prefix test and why it is a fallback.
     public static bool IsFromSubjectNamespace(string description, HashSet<string> subjectNamespaces)
     {
         if (string.IsNullOrWhiteSpace(description) || subjectNamespaces.Count == 0)
