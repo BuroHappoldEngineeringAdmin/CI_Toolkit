@@ -557,6 +557,47 @@ runs:
         }
         Write-Host "::notice title=Versioning::Found versioning datasets for: $($versions.Name -join ', ')"
 
+    # Precondition, not a policy choice. The runner is handed
+    # --subject-assemblies "<workspace>\Build" and restricts attribution to the
+    # namespaces the assemblies there declare. If that directory is absent it falls
+    # back to attributing every failure across the whole dependency closure, which
+    # reports other repositories' defects against this one: measured at 1,056 of 1,056
+    # on a real pull request. The runner does warn, but on stderr, and a warning does
+    # not stop the check producing a verdict it has no basis for.
+    #
+    # Asserted here rather than left to the runner because this is a property of the
+    # build, and the build is this action's job. Same shape as the dataset guard above.
+    #
+    # Not the vacuous-green question. "Nothing to check" is a legitimate green;
+    # "the thing to check was never built" is a broken precondition. This is the second.
+    #
+    # Two causes when it fires, and they need different fixes. Either the projects declare
+    # <OutputPath>..\Build\ only inside PropertyGroups conditioned on Debug or Test, so a
+    # Release build does not apply it; or they declare no <OutputPath> at all and take the
+    # SDK default. Both send output to bin\<config>\<tfm>\ and leave Build\ absent.
+    #
+    # Neither is a fault in those repositories. Nothing ever verified this directory: the
+    # convention was enforced by a linter that only rewrote <OutputPath> lines already
+    # present, and no check read Build\ until this one.
+    - name: Validate subject build output
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $subjectDir = "${{ github.workspace }}\Build"
+
+        if (-not (Test-Path $subjectDir)) {
+          Write-Host "::error title=Versioning::Subject build output missing at $subjectDir. This repository's own assemblies were not built to the directory the check attributes against, so no failure could be attributed to it. Two usual causes: the projects declare <OutputPath>..\Build\ only under Debug or Test conditions, which a Release build does not apply; or they declare no <OutputPath> at all and take the SDK default. Either way the output went to bin\Release\<tfm>\ instead."
+          exit 1
+        }
+
+        $dlls = @(Get-ChildItem $subjectDir -Filter *.dll -Recurse -ErrorAction SilentlyContinue)
+        if ($dlls.Count -eq 0) {
+          Write-Host "::error title=Versioning::Subject build output at $subjectDir contains no assemblies. The directory exists but nothing was built into it, so no failure could be attributed to this repository."
+          exit 1
+        }
+
+        Write-Host "::notice title=Versioning::Subject build output: $($dlls.Count) assembl(ies) in $subjectDir."
+
     - name: Prepare VersioningRunner
       id: runner
       if: steps.changed.outputs.count != '0'
