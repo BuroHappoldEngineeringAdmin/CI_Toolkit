@@ -770,10 +770,19 @@ runs:
 
         $attribution = '(not reported)'
         $classification = '(not reported)'
+        # Which evidence attributed each finding. Surfaced here and not only in the log because
+        # the number that matters is the namespace-fallback count: that path cannot tell this
+        # repository's types from those of repositories extending its namespace, so a non-zero
+        # value means some findings may not be this repository's. The runner also emits a
+        # ::warning, but stderr is deliberately not teed into the file this summary reads
+        # (see the tee step), so without this line the summary would not carry it at all.
+        $attributionBasis = '(not reported)'
         if (Test-Path 'versioning-stdout.txt') {
           $out = Get-Content 'versioning-stdout.txt' -Raw
-          if ($out -match 'Attribution:\s*(.+)')    { $attribution    = $Matches[1].Trim() }
-          if ($out -match 'Classification:\s*(.+)') { $classification = $Matches[1].Trim() }
+          # 'Attribution basis:' does not contain 'Attribution:', so these cannot cross-match.
+          if ($out -match 'Attribution:\s*(.+)')       { $attribution      = $Matches[1].Trim() }
+          if ($out -match 'Classification:\s*(.+)')    { $classification   = $Matches[1].Trim() }
+          if ($out -match 'Attribution basis:\s*(.+)') { $attributionBasis = $Matches[1].Trim() }
         }
 
         $rows = @()
@@ -812,6 +821,7 @@ runs:
         $md += "| | |"
         $md += "|---|---|"
         $md += "| Classification | ``$classification`` |"
+        $md += "| Attribution basis | ``$attributionBasis`` |"
         $md += "| Reported unverified | $unverified |"
         if ($coverage) {
           $md += "| Surface examined | $($coverage.SubjectTypes) subject types across $($coverage.SubjectAssemblies) subject assemblies |"

@@ -365,6 +365,11 @@ namespace VersioningRunner.Tests
         }
     }
 
+    // IsFromSubjectNamespace is no longer the attribution mechanism. It is the fallback used
+    // only when a failure records no declaring assembly, because the description alone cannot
+    // say whether its last segment is a type or a method and so cannot separate a repository's
+    // own types from those of repositories extending its namespace. These cases still hold for
+    // what the function does; SubjectAttributionDecisionTests covers which one gets consulted.
     public class SubjectAttributionTests
     {
         private static HashSet<string> Namespaces(params string[] ns) =>
@@ -564,7 +569,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips);
 
             Assert.Equal(VersioningStatus.Pass, result.Status);
             Assert.Equal(0, result.FailureCount);
@@ -589,7 +594,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips);
 
             Assert.Equal(VersioningStatus.Error, result.Status);
             Assert.Equal(1, result.FailureCount);
@@ -647,7 +652,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips,
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips,
                 probeSignature: (_, _, _) => ("Autodesk.Revit.DB.LogicalOrFilter", ClassificationPath.SignatureBlockerOutsideBHoM, Array.Empty<string>()));
 
             Assert.Equal(0, result.FailureCount);
@@ -675,7 +680,7 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             // Probe finds no blocker, so this stays a real failure — but actionable.
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.Revit.Engine.MechanicalPlumbing.Create.SomethingGenuine",
@@ -697,7 +702,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leaf] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), null, probeSignature: (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.oM.Adapters.File.FileSettings", result.Failures[0].Description);
@@ -716,7 +721,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leaf] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Equal("BH.oM.Adapters.File.FileSettings", result.Failures[0].Description);
@@ -735,11 +740,11 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var subject = Namespaces("BH.oM.Adapters.File");
-            var filtered = RunCommand.ExtractFilteredResult(outer, d => RunCommand.IsFromSubjectNamespace(d, subject));
+            var filtered = RunCommand.ExtractFilteredResult(outer, (d, _) => (RunCommand.IsFromSubjectNamespace(d, subject), AttributionBasis.NamespaceFallback));
             Assert.Equal(VersioningStatus.Pass, filtered.Status);
             Assert.Equal(0, filtered.FailureCount);
 
-            var kept = RunCommand.ExtractFilteredResult(outer, _ => true);
+            var kept = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded));
             Assert.Equal(VersioningStatus.Error, kept.Status);
             Assert.Equal(1, kept.FailureCount);
         }
@@ -773,7 +778,7 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             RunCommand.ExtractFilteredResult(Tree("BH.oM.Adapters.File.FileSettings", RevitCause),
-                _ => true, null, null, diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, null, diagnostics);
 
             var only = Assert.Single(diagnostics);
             Assert.False(only.CountedAsReal);
@@ -788,7 +793,7 @@ namespace VersioningRunner.Tests
             // real by default rather than by evidence.
             var diagnostics = new List<FailureDiagnostic>();
             var result = RunCommand.ExtractFilteredResult(Tree("BH.oM.Adapters.File.FileSettings"),
-                _ => true, null, (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()), diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, (_, _, _) => (null, ClassificationPath.NoOverloadFound, Array.Empty<string>()), diagnostics);
 
             Assert.Equal(1, result.FailureCount);
             var only = Assert.Single(diagnostics);
@@ -802,7 +807,7 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             RunCommand.ExtractFilteredResult(Tree("BH.Revit.Engine.MechanicalPlumbing.Compute. }", MethodCause),
-                _ => true, null, (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()), diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()), diagnostics);
 
             var only = Assert.Single(diagnostics);
             Assert.True(only.CountedAsReal);
@@ -819,7 +824,7 @@ namespace VersioningRunner.Tests
             string? seen = "not called";
             RunCommand.ExtractFilteredResult(
                 Tree("BH.Revit.Engine.MechanicalPlumbing.Compute. }", MethodCause),
-                _ => true, null,
+                (_, _) => (true, AttributionBasis.NotRecorded), null,
                 (_, _, asm) => { seen = asm; return (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()); },
                 null);
 
@@ -844,7 +849,7 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leafReal, leafUnverified] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, _ => true, skips, null, diagnostics);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips, null, diagnostics);
 
             Assert.Equal(1, result.FailureCount);
             Assert.Single(skips);

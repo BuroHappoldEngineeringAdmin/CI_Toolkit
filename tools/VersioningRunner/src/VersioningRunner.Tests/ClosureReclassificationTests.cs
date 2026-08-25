@@ -62,7 +62,7 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             var result = RunCommand.ExtractFilteredResult(
-                tree, _ => true, new List<RunCommand.UnverifiedFailure>(),
+                tree, (_, _) => (true, AttributionBasis.NotRecorded), new List<RunCommand.UnverifiedFailure>(),
                 (t, m, a) => probe(t, m, a), diagnostics, closure);
             return (result, Assert.Single(diagnostics));
         }

@@ -48,6 +48,27 @@ public enum ClassificationPath
     ConfigurationNotBuilt,
 }
 
+// Which evidence decided that a failure belongs to the subject repository.
+//
+// The two are not equally trustworthy and the difference is the whole point of recording it.
+// A declaring assembly is unambiguous: the dataset record names it, and the subject either
+// staged an assembly of that name or it did not. A description is ambiguous: it arrives
+// either as a type full name or as "DeclaringType.MethodName" and nothing in the string says
+// which, so BH.Adapter.ETABS.ETABSAdapter (another repository's type) and
+// BH.Adapter.BHoMAdapter.Push (this repository's method) have the same shape. No matching
+// rule over the string can separate them, which is why the assembly decides where one exists.
+public enum AttributionBasis
+{
+    // Whole-closure attribution, where there is no subject set to compare against.
+    NotRecorded,
+    // The dataset record named a declaring assembly and the subject build staged it.
+    DeclaringAssembly,
+    // No declaring assembly was recorded, so the namespace decided it. This path still
+    // over-attributes a repository that owns a namespace others extend, and is counted in
+    // the run output for exactly that reason: its size must be measured, not assumed.
+    NamespaceFallback,
+}
+
 // What this run actually built, needed to tell "the recorded declaring
 // assembly is missing because it is someone else's" from "because we did not compile that
 // configuration" from "because it was genuinely removed". Passed explicitly rather than
@@ -89,7 +110,10 @@ public record FailureDiagnostic(
     // Build configuration this run compiled, carried per row so a finding read on its
     // own is interpretable. Human-legible; it does not by itself explain a divergence.
     string? Configuration = null,
-    VersionConditionalState VersionConditional = VersionConditionalState.Unknown);
+    VersionConditionalState VersionConditional = VersionConditionalState.Unknown,
+    // Which evidence attributed this failure to the subject. Per row rather than only as a
+    // total, so a reader can tell whether any individual finding rests on the ambiguous path.
+    AttributionBasis AttributedBy = AttributionBasis.NotRecorded);
 
 // Coverage denominator. A verdict without one cannot be interpreted: a pass over zero
 // methods reads identically to a pass over seven thousand. BHoMBot reported object
