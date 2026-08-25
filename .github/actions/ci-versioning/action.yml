@@ -571,9 +571,14 @@ runs:
     # Not the vacuous-green question. "Nothing to check" is a legitimate green;
     # "the thing to check was never built" is a broken precondition. This is the second.
     #
-    # Usual cause when it fires: the repository's projects declare <OutputPath>..\Build\
-    # only inside PropertyGroups conditioned on Debug or Test, so a Release build writes
-    # to the SDK default bin\Release\<tfm>\ instead and Build\ is never created.
+    # Two causes when it fires, and they need different fixes. Either the projects declare
+    # <OutputPath>..\Build\ only inside PropertyGroups conditioned on Debug or Test, so a
+    # Release build does not apply it; or they declare no <OutputPath> at all and take the
+    # SDK default. Both send output to bin\<config>\<tfm>\ and leave Build\ absent.
+    #
+    # Neither is a fault in those repositories. Nothing ever verified this directory: the
+    # convention was enforced by a linter that only rewrote <OutputPath> lines already
+    # present, and no check read Build\ until this one.
     - name: Validate subject build output
       if: steps.changed.outputs.count != '0'
       shell: pwsh
@@ -581,7 +586,7 @@ runs:
         $subjectDir = "${{ github.workspace }}\Build"
 
         if (-not (Test-Path $subjectDir)) {
-          Write-Host "::error title=Versioning::Subject build output missing at $subjectDir. This repository's own assemblies were not built to the directory the check attributes against, so no failure could be attributed to it. Most often the projects set <OutputPath>..\Build\ only for Debug or Test configurations; the check builds Release."
+          Write-Host "::error title=Versioning::Subject build output missing at $subjectDir. This repository's own assemblies were not built to the directory the check attributes against, so no failure could be attributed to it. Two usual causes: the projects declare <OutputPath>..\Build\ only under Debug or Test conditions, which a Release build does not apply; or they declare no <OutputPath> at all and take the SDK default. Either way the output went to bin\Release\<tfm>\ instead."
           exit 1
         }
 
