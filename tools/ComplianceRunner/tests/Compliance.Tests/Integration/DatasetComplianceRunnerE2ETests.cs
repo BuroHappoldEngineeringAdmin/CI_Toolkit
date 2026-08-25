@@ -80,11 +80,21 @@ public class DatasetComplianceRunnerE2ETests
     // ── GitHub Actions output format ──────────────────────────────────────────
 
     [Test]
-    public void GitHubOutput_ForPassingRun_ProducesNoAnnotationLines()
+    public void GitHubOutput_ForPassingRun_ProducesNoFindingAnnotations()
     {
+        // This previously asserted stdout was entirely empty. That silence was the defect: a run
+        // that examined nothing looked exactly like a run that examined everything. What a
+        // passing run must not produce is a *finding* annotation, which is what the name means
+        // and what is asserted now. The coverage output is not a finding and changes no verdict.
         var (exitCode, stdout) = RunnerFixture.Run("DatasetComplianceRunner",
             "--output", "github", "notadataset/foo.json");
-        Assert.That(exitCode, Is.EqualTo(0));
-        Assert.That(stdout.Trim(), Is.Empty);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(exitCode, Is.EqualTo(0));
+            Assert.That(stdout, Does.Not.Contain("::error"));
+            Assert.That(stdout, Does.Contain("Coverage: 0 of 1 file(s) examined"));
+            Assert.That(stdout, Does.Contain("::warning title=Compliance coverage::"));
+        });
     }
 }

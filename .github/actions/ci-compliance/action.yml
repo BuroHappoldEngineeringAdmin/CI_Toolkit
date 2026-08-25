@@ -130,19 +130,39 @@ runs:
         # DatasetComplianceRunner has a different CLI shape: no check-type
         # argument, no --org-url, and all positional args are treated as file
         # paths. Branch the invocation accordingly.
+        # Tee'd rather than piped straight through: the coverage line has to reach the job
+        # summary, and the runner's own stdout is inside the group above, which the UI
+        # collapses by default. A count nobody expands is not a count anybody reads.
         if ($check -eq "dataset") {
-          & $runnerExe --output github @fileList
+          $runnerOutput = & $runnerExe --output github @fileList 2>&1
         } else {
-          & $runnerExe $check --output github --org-url "$orgUrl" @fileList
+          $runnerOutput = & $runnerExe $check --output github --org-url "$orgUrl" @fileList 2>&1
         }
         $exitCode = $LASTEXITCODE
+
+        # Re-emitted verbatim. Capturing is what lets the coverage line reach the summary below;
+        # the annotations and workflow commands in this output still have to reach the log, and
+        # Write-Host is what puts them there.
+        $runnerOutput | ForEach-Object { Write-Host $_ }
         Write-Host "::endgroup::"
 
         if ($env:GITHUB_STEP_SUMMARY) {
           $status = if ($exitCode -eq 0) { "passed" } else { "**failed**" }
-          @(
-            "### $check compliance $status"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          # One well-defined line the runner controls. Absent rather than fatal if the runner
+          # is older than this action, since the two version independently.
+          $coverage = $runnerOutput |
+                      Where-Object { $_ -match '^Coverage: ' } |
+                      Select-Object -First 1
+
+          $summary = @("### $check compliance $status")
+          if ($coverage) {
+            # Verbatim. Rewording it here would put the same sentence in two places and let
+            # them drift; the runner owns the wording and this owns where it appears.
+            $summary += ""
+            $summary += $coverage
+          }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
         }
 
         exit $exitCode

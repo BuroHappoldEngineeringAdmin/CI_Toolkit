@@ -69,20 +69,22 @@ public class MainAccountingTests
     }
 
     [Test]
-    [Description("The count of files actually examined is not reported anywhere.")]
-    public void ExaminedCount_IsNotReported()
+    [Description("The count of files actually examined is reported.")]
+    public void ExaminedCount_IsReported()
     {
-        // Contrast with VersioningRunner, which prints a Coverage line precisely so that a
-        // pass over zero and a pass over thousands are distinguishable (RunCommand.cs:226-230).
-        // ComplianceRunner has no equivalent, so a pass that examined nothing is
-        // indistinguishable in the log from one that examined everything.
+        // This was the inverse assertion: it recorded that no count existed, and said adding one
+        // was the cheapest partial mitigation and did not depend on the pass-versus-fail question
+        // being settled. The count now exists, so the assertion is inverted. The pass-versus-fail
+        // question is still open and this still does not touch it.
+        //
+        // Matches VersioningRunner, which prints a Coverage line precisely so that a pass over
+        // zero and a pass over thousands are distinguishable.
         var (_, stdout) = RunnerFixture.Run("ComplianceRunner",
             "code", "--output", "github", "a.cs", "b.cs", "c.cs");
 
-        Assert.That(stdout, Does.Not.Contain("examined"),
-            "There is no coverage line. Adding one is the cheapest partial mitigation and does "
-          + "not depend on how the pass-versus-fail question is settled, because reporting the "
-          + "number changes no verdict.");
+        Assert.That(stdout, Does.Contain("0 of 3 file(s) examined"),
+            "A pass that examined nothing must be distinguishable from one that examined "
+          + "everything, which is what the denominator is for.");
     }
 
     // ── Machine-readable output and the [SKIP] diagnostic ─────────────────────────────
