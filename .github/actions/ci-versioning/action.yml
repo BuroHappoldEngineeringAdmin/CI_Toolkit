@@ -149,6 +149,27 @@ runs:
       uses: BHoM/CI_Toolkit/.github/actions/discover-solution@develop
       with:
         check_title: Versioning
+    # --- Subject assembly bracket: opens here, closes after the alt-config builds ---
+    #
+    # The two steps between these snapshots are the only ones that build this repository, and
+    # everything a BHoM project builds is staged into the assembly directory by its PostBuild
+    # step. So the difference between the two snapshots is exactly this repository's own output.
+    #
+    # NOTHING MAY BE INSERTED BETWEEN THEM. Any step that builds, restores or copies into the
+    # assembly directory would be attributed to this repository and widen the subject set.
+    # Later steps deliberately fall outside: the Revit mocks, the upgrades recapture and the
+    # verification-solution build all stage assemblies that are not this repository's.
+    # ci-versioning-action.Tests.ps1 fails if a step is added inside the bracket.
+    - name: Snapshot staged assemblies (before subject build)
+      id: stage_before
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Get-StagedAssemblies.ps1"
+        . $script
+        Get-AssemblyStamp -Path 'C:\ProgramData\BHoM\Assemblies' |
+          Set-Content -Path 'staged-before.txt' -Encoding utf8
+        Write-Host "Staged before subject build: $(@(Get-Content 'staged-before.txt' -ErrorAction SilentlyContinue).Count) assembl(ies)."
 
     - name: Build primary repo
       id: build_subject
@@ -185,6 +206,30 @@ runs:
         # .github/scripts. Same derivation prepare-runner already uses.
         $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Build-AltConfigs.ps1"
         & $script -SlnPath "${{ steps.solution.outputs.path }}" -Configuration "Release"
+
+    # --- Subject assembly bracket: closes here ---
+    - name: Collect subject assemblies
+      id: subject_set
+      if: steps.changed.outputs.count != '0'
+      shell: pwsh
+      run: |
+        $script = Join-Path $env:GITHUB_ACTION_PATH "../../scripts/Get-StagedAssemblies.ps1"
+        . $script
+
+        $before = @(Get-Content 'staged-before.txt' -ErrorAction SilentlyContinue)
+        $after  = Get-AssemblyStamp -Path 'C:\ProgramData\BHoM\Assemblies'
+        $subject = @(Get-NewlyStagedAssemblies -Before $before -After $after)
+
+        # Alt configurations are inside the bracket on purpose. A Revit repository's
+        # year-suffixed assemblies are its own code, so attributing failures in them to it is
+        # correct, and excluding them would understate what the check covers.
+        $subject | Set-Content -Path 'subject-assemblies.txt' -Encoding utf8
+        Write-Host "Subject assemblies staged by this repository's build: $($subject.Count)."
+        if ($subject.Count -gt 0) {
+          Write-Host "::group::Subject assemblies"
+          $subject | ForEach-Object { Write-Host "  $_" }
+          Write-Host "::endgroup::"
+        }
 
     # There is deliberately no build-completeness fast-fail here any more.
     #
@@ -557,46 +602,40 @@ runs:
         }
         Write-Host "::notice title=Versioning::Found versioning datasets for: $($versions.Name -join ', ')"
 
-    # Precondition, not a policy choice. The runner is handed
-    # --subject-assemblies "<workspace>\Build" and restricts attribution to the
-    # namespaces the assemblies there declare. If that directory is absent it falls
-    # back to attributing every failure across the whole dependency closure, which
-    # reports other repositories' defects against this one: measured at 1,056 of 1,056
-    # on a real pull request. The runner does warn, but on stderr, and a warning does
-    # not stop the check producing a verdict it has no basis for.
+    # Precondition, not a policy choice. Attribution narrows to the namespaces this
+    # repository's own assemblies declare; with no assemblies there is nothing to narrow to,
+    # and the runner would widen to the whole dependency closure and report other
+    # repositories' failures against this one. Measured at 1,056 of 1,056 on a real pull
+    # request.
     #
-    # Asserted here rather than left to the runner because this is a property of the
-    # build, and the build is this action's job. Same shape as the dataset guard above.
+    # Asserted here rather than in the runner because it is a property of the build, and the
+    # build is this action's job. Same shape as the datasets guard above.
     #
-    # Not the vacuous-green question. "Nothing to check" is a legitimate green;
-    # "the thing to check was never built" is a broken precondition. This is the second.
+    # Not the vacuous-green question. "Nothing to check" is a legitimate green; "the thing to
+    # check was never built" is a broken precondition. This is the second.
     #
-    # Two causes when it fires, and they need different fixes. Either the projects declare
-    # <OutputPath>..\Build\ only inside PropertyGroups conditioned on Debug or Test, so a
-    # Release build does not apply it; or they declare no <OutputPath> at all and take the
-    # SDK default. Both send output to bin\<config>\<tfm>\ and leave Build\ absent.
-    #
-    # Neither is a fault in those repositories. Nothing ever verified this directory: the
-    # convention was enforced by a linter that only rewrote <OutputPath> lines already
-    # present, and no check read Build\ until this one.
+    # When this fires it is a build problem, not a configuration one: the solution built, but
+    # staged no assemblies into the shared assembly directory. Every BHoM project stages its
+    # output there through a PostBuild step, so a repository producing none either built
+    # nothing or has lost that step.
     - name: Validate subject build output
       if: steps.changed.outputs.count != '0'
       shell: pwsh
       run: |
-        $subjectDir = "${{ github.workspace }}\Build"
+        $listPath = 'subject-assemblies.txt'
 
-        if (-not (Test-Path $subjectDir)) {
-          Write-Host "::error title=Versioning::Subject build output missing at $subjectDir. This repository's own assemblies were not built to the directory the check attributes against, so no failure could be attributed to it. Two usual causes: the projects declare <OutputPath>..\Build\ only under Debug or Test conditions, which a Release build does not apply; or they declare no <OutputPath> at all and take the SDK default. Either way the output went to bin\Release\<tfm>\ instead."
+        if (-not (Test-Path $listPath)) {
+          Write-Host "::error title=Versioning::Subject assembly list missing. The step that collects this repository's build output did not run, so attribution has no subject set."
           exit 1
         }
 
-        $dlls = @(Get-ChildItem $subjectDir -Filter *.dll -Recurse -ErrorAction SilentlyContinue)
-        if ($dlls.Count -eq 0) {
-          Write-Host "::error title=Versioning::Subject build output at $subjectDir contains no assemblies. The directory exists but nothing was built into it, so no failure could be attributed to this repository."
+        $subject = @(Get-Content $listPath | Where-Object { $_.Trim() })
+        if ($subject.Count -eq 0) {
+          Write-Host "::error title=Versioning::This repository's build staged no assemblies. The solution built, but nothing reached C:\ProgramData\BHoM\Assemblies, so no failure could be attributed to this repository. Every BHoM project stages its output there through a PostBuild step; a repository producing none either built no assemblies or is missing that step."
           exit 1
         }
 
-        Write-Host "::notice title=Versioning::Subject build output: $($dlls.Count) assembl(ies) in $subjectDir."
+        Write-Host "::notice title=Versioning::Subject set: $($subject.Count) assembl(ies) staged by this repository's build."
 
     - name: Prepare VersioningRunner
       id: runner
@@ -670,7 +709,7 @@ runs:
       if: steps.changed.outputs.count != '0'
       shell: pwsh
       run: |
-        # --subject-assemblies restricts attribution to the namespaces this repo's own
+        # --subject-assembly-list restricts attribution to the namespaces this repo's own
         # assemblies declare. Without it, failures are attributed on a 3-segment
         # namespace prefix over the whole dependency closure, which cannot distinguish
         # BH.oM.Adapters.File from BH.oM.Adapters.ETABS: the v9.2 datasets name thousands
@@ -690,7 +729,7 @@ runs:
         # annotations were produced, against two on a comparable production run.
         & "${{ steps.runner.outputs.runner_exe }}" `
             --assemblies         'C:\ProgramData\BHoM\Assemblies' `
-            --subject-assemblies "${{ github.workspace }}\Build" `
+            --subject-assembly-list 'subject-assemblies.txt' `
             --configuration      'Release' `
             $(if ('${{ steps.vercond.outputs.file }}') { '--version-conditional', '${{ steps.vercond.outputs.file }}' }) `
             --output             'versioning-result.json' |

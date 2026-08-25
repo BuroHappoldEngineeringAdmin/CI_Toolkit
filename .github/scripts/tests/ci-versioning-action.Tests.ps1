@@ -30,11 +30,11 @@ Describe 'ci-versioning action.yml' {
         }
 
         It 'guards the subject build output the same way' {
-            $text | Should -Match 'Subject build output missing at' -Because 'an absent subject directory makes the check attribute every failure across the whole closure'
+            $text | Should -Match 'Subject assembly list missing' -Because 'without a subject set the check attributes every failure across the whole closure'
         }
 
-        It 'also rejects a subject directory that exists but is empty' {
-            $text | Should -Match 'contains no assemblies' -Because 'a present but empty directory yields an empty subject set, which reports nothing and passes'
+        It 'also rejects a subject set that was collected but is empty' {
+            $text | Should -Match 'staged no assemblies' -Because 'an empty subject set attributes nothing and passes green having measured nothing'
         }
 
         It 'fails rather than warns, because the check cannot do its job without it' {
@@ -52,13 +52,54 @@ Describe 'ci-versioning action.yml' {
             $guardIdx | Should -BeLessThan $runnerIdx
         }
 
-        # Substring rather than regex: the path contains backslashes and braces, and a guard
-        # that checked a different directory from the one the runner reads would pass a
-        # loosely-written pattern while protecting nothing.
-        It 'checks the same directory the runner is pointed at' {
-            $subjectPath = '"${{ github.workspace }}\Build"'
-            $text.Contains('$subjectDir = ' + $subjectPath)          | Should -BeTrue -Because 'the guard must read the path the runner is given'
-            $text.Contains('--subject-assemblies ' + $subjectPath)   | Should -BeTrue -Because 'if the runner argument changes, this guard stops protecting it'
+        # The guard and the runner must read the same artefact. If they diverge the guard
+        # passes on one thing while the runner attributes against another, which is the
+        # failure it exists to prevent, one level removed.
+        It 'checks the same artefact the runner is given' {
+            $artefact = 'subject-assemblies.txt'
+            $text.Contains("Set-Content -Path '$artefact'")      | Should -BeTrue -Because 'the collection step writes it'
+            $text.Contains("`$listPath = '$artefact'")           | Should -BeTrue -Because 'the guard reads it'
+            $text.Contains("--subject-assembly-list '$artefact'") | Should -BeTrue -Because 'the runner is given it'
+        }
+    }
+
+    Context 'the subject-assembly bracket' {
+
+        # The subject set is the difference between two snapshots of the shared assembly
+        # directory, so it is exactly whatever was staged between them. That makes the bracket
+        # an ordering assumption in a file where steps get inserted, and an inserted step that
+        # builds or copies would be silently attributed to the repository under test.
+        #
+        # This asserts the shape rather than today's list: it fails when anything is added
+        # inside the bracket, which is the point. If a step genuinely belongs there, this test
+        # is the place to say so deliberately.
+        It 'contains exactly the two steps that build this repository' {
+            $open  = ($lines | Select-String -Pattern '- name: Snapshot staged assemblies' | Select-Object -First 1).LineNumber
+            $close = ($lines | Select-String -Pattern '- name: Collect subject assemblies'  | Select-Object -First 1).LineNumber
+
+            $open  | Should -Not -BeNullOrEmpty
+            $close | Should -BeGreaterThan $open
+
+            $inner = $lines[$open..($close - 2)] | Where-Object { $_ -match '^\s+- name: ' }
+            @($inner).Count | Should -Be 2 -Because "only the primary and alt-config builds may sit inside the bracket; found:`n$($inner -join "`n")"
+            ($inner -join ' ') | Should -Match 'Build primary repo'
+            ($inner -join ' ') | Should -Match 'Build alt configurations'
+        }
+
+        # A nested action inside the bracket could wipe or repopulate the assembly directory,
+        # which would corrupt the difference without adding a step name anyone would question.
+        It 'contains no nested action call' {
+            $open  = ($lines | Select-String -Pattern '- name: Snapshot staged assemblies' | Select-Object -First 1).LineNumber
+            $close = ($lines | Select-String -Pattern '- name: Collect subject assemblies'  | Select-Object -First 1).LineNumber
+
+            $uses = $lines[$open..($close - 2)] | Where-Object { $_ -match '^\s+uses:' }
+            @($uses).Count | Should -Be 0 -Because "a nested action inside the bracket can change the assembly directory: $($uses -join '; ')"
+        }
+
+        It 'closes after the alt-config build, so alt configurations are included' {
+            $alt   = ($lines | Select-String -Pattern '- name: Build alt configurations' | Select-Object -First 1).LineNumber
+            $close = ($lines | Select-String -Pattern '- name: Collect subject assemblies' | Select-Object -First 1).LineNumber
+            $close | Should -BeGreaterThan $alt -Because 'a Revit repository year-suffixed assemblies are its own code and belong in the subject set'
         }
     }
 }

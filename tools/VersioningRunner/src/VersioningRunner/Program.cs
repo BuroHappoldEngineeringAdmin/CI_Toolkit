@@ -29,7 +29,7 @@ AssemblyLoadContext.Default.Resolving += static (context, name) =>
 
 if (args.Length == 0 || args.Contains("--help") || args.Contains("-h"))
 {
-    Console.WriteLine("Usage: VersioningRunner [--assemblies <path>] [--output <file>] [--test-all] [--subject-assemblies <dir>] [--configuration <name>] [--version-conditional <file>]");
+    Console.WriteLine("Usage: VersioningRunner [--assemblies <path>] [--output <file>] [--test-all] [--subject-assembly-list <file>] [--configuration <name>] [--version-conditional <file>]");
     Console.WriteLine();
     Console.WriteLine("Options:");
     Console.WriteLine("  --assemblies <path>          BHoM assemblies folder (default: C:\\ProgramData\\BHoM\\Assemblies)");
@@ -40,15 +40,16 @@ if (args.Length == 0 || args.Contains("--help") || args.Contains("-h"))
     Console.WriteLine("                               conditional in the subject's source, one per line. A present file");
     Console.WriteLine("                               means the scan ran, so unlisted methods record No. Omit the flag");
     Console.WriteLine("                               only when no scan was performed: findings then record Unknown.");
-    Console.WriteLine("  --subject-assemblies <dir>   Subject repo's build output. Failures are attributed only to");
-    Console.WriteLine("                               namespaces these assemblies declare (default: the whole closure)");
+    Console.WriteLine("  --subject-assembly-list <file>  File listing the assemblies this repo's own build staged,");
+    Console.WriteLine("                               one name per line. Failures are attributed only to namespaces");
+    Console.WriteLine("                               those assemblies declare (default: the whole closure).");
     return 1;
 }
 
 string assemblies = GetArg(args, "--assemblies") ?? @"C:\ProgramData\BHoM\Assemblies";
 string? output = GetArg(args, "--output");
 bool testAll = args.Contains("--test-all");
-string? subject = GetArg(args, "--subject-assemblies");
+string? subject = GetArg(args, "--subject-assembly-list");
 
 string? configuration = GetArg(args, "--configuration");
 string? vcFile = GetArg(args, "--version-conditional");

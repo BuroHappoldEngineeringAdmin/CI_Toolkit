@@ -14,7 +14,7 @@ public static class RunCommand
         string assembliesPath,
         string? outputPath,
         bool testAll,
-        string? subjectBuildDir = null,
+        string? subjectAssemblyList = null,
         string? configuration = null,
         IReadOnlyCollection<string>? versionConditionalMethods = null)
     {
@@ -63,25 +63,25 @@ public static class RunCommand
         // assembly correctly. Null when no subject build dir was supplied: with whole-closure
         // attribution there is no basis for calling any assembly foreign, so the
         // reclassification is disabled and the fail-safe default stands.
+        HashSet<string>? subjectFileNames = ReadSubjectAssemblyList(subjectAssemblyList);
+
         ClosureContext? closure = null;
-        if (subjectBuildDir is not null && Directory.Exists(subjectBuildDir))
+        if (subjectFileNames is { Count: > 0 })
         {
             var loadedNames = new HashSet<string>(
                 loaded.Select(a => { try { return a.GetName().Name; } catch { return null; } })
                       .Where(n => !string.IsNullOrEmpty(n))!,
                 StringComparer.Ordinal);
             var subjectBases = new HashSet<string>(
-                Directory.GetFiles(subjectBuildDir, "*.dll", SearchOption.AllDirectories)
-                         .Select(f => StripConfigSuffix(Path.GetFileNameWithoutExtension(f))),
+                subjectFileNames.Select(f => StripConfigSuffix(Path.GetFileNameWithoutExtension(f))),
                 StringComparer.Ordinal);
-            if (subjectBases.Count > 0)
-                closure = new ClosureContext(
-                    loadedNames,
-                    new HashSet<string>(loadedNames.Select(StripConfigSuffix), StringComparer.Ordinal),
-                    subjectBases);
+            closure = new ClosureContext(
+                loadedNames,
+                new HashSet<string>(loadedNames.Select(StripConfigSuffix), StringComparer.Ordinal),
+                subjectBases);
         }
 
-        var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectBuildDir);
+        var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectFileNames);
         Func<string, bool> isAttributable;
         if (subjectNamespaces is null)
         {
@@ -586,29 +586,56 @@ public static class RunCommand
     // whole-closure behaviour). Names come off the build output but are resolved against
     // the loaded set, which is authoritative, so a stale Build\ entry cannot introduce a
     // namespace for an assembly that is not actually present.
-    internal static HashSet<string>? BuildSubjectNamespaces(List<Assembly> loaded, string? subjectBuildDir)
+
+    // The subject set is the assemblies this repository's own build staged, handed over as a
+    // list the caller computed rather than a directory this reads.
+    //
+    // It used to be a directory, `<workspace>\Build`, which the caller assumed every project
+    // wrote to. Nothing guaranteed that: the convention was enforced by a linter that only
+    // rewrote OutputPath values already present and never inspected which configuration they
+    // applied to, and no check read the directory until this one. Measured across 138 projects,
+    // 30% did not write there under the configuration CI builds, and a different 35% would not
+    // under the other one. So there was no configuration that made it reliable.
+    //
+    // A list has a property the directory did not: it describes what happened rather than what
+    // was declared. It also cannot be partially right. A directory holding some of the
+    // repository's assemblies produced a subject set that looked plausible and silently covered
+    // a fraction of the repo, with nothing to indicate it.
+    //
+    // Null means no list was supplied and attribution falls back to the whole closure, which
+    // over-reports. Empty means the list was supplied and the build staged nothing, which is a
+    // different state and is warned about by the caller before this runs.
+    // Split from the file read so the name handling can be tested without a temp file.
+    internal static HashSet<string> ReadSubjectAssemblyListFrom(IEnumerable<string> entries) =>
+        new(entries.Select(l => l.Trim())
+                   .Where(l => l.Length > 0)
+                   .Select(Path.GetFileName)
+                   .Where(n => !string.IsNullOrEmpty(n))!,
+            StringComparer.OrdinalIgnoreCase);
+
+    internal static HashSet<string>? ReadSubjectAssemblyList(string? listPath)
     {
-        if (string.IsNullOrWhiteSpace(subjectBuildDir))
+        if (string.IsNullOrWhiteSpace(listPath))
             return null;
 
-        if (!Directory.Exists(subjectBuildDir))
+        if (!File.Exists(listPath))
         {
             Console.Error.WriteLine(
-                $"::warning title=Versioning::Subject build directory '{subjectBuildDir}' not found. " +
+                $"::warning title=Versioning::Subject assembly list '{listPath}' not found. " +
                 "Falling back to attributing failures across the whole dependency closure, " +
                 "which over-reports: failures owned by dependencies will be attributed to this repo.");
             return null;
         }
 
-        // Recursive because the layout under Build\ varies by project style, measured:
-        // SDK-style repos append the TFM (File_Toolkit -> Build\netstandard2.0\File_oM.dll)
-        // while the old-style Revit projects are flat (Build\Revit_X_oM_2022.dll). A
-        // top-level scan finds nothing for the former, which silently empties the subject
-        // set. Safe to recurse: BHoM references carry <Private>False</Private>, so a
-        // dependency's DLL is never copied into the subject's output.
-        var subjectFiles = new HashSet<string>(
-            Directory.GetFiles(subjectBuildDir, "*.dll", SearchOption.AllDirectories).Select(Path.GetFileName)!,
-            StringComparer.OrdinalIgnoreCase);
+        // Names, not paths. Callers may write either; the comparison downstream is by file
+        // name, because that is what identifies an assembly in the staged set.
+        return ReadSubjectAssemblyListFrom(File.ReadAllLines(listPath));
+    }
+
+    internal static HashSet<string>? BuildSubjectNamespaces(List<Assembly> loaded, HashSet<string>? subjectFiles)
+    {
+        if (subjectFiles is null)
+            return null;
 
         var namespaces = new HashSet<string>(StringComparer.Ordinal);
         int unreadable = 0;
@@ -672,7 +699,7 @@ public static class RunCommand
         s_subjectTypeCount = subjectTypeCount;
 
         Console.WriteLine(
-            $"Subject assemblies: {subjectFiles.Count} name(s) in {subjectBuildDir}, " +
+            $"Subject assemblies: {subjectFiles.Count} name(s) staged by the subject build, " +
             $"{subjectFiles.Count(f => loaded.Any(a => PathName(a) == f))} present in the loaded set");
         return namespaces;
 

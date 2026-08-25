@@ -428,76 +428,86 @@ namespace VersioningRunner.Tests
         }
 
         [Fact]
-        public void NoSubjectDirSupplied_FallsBackToWholeClosure()
+        public void NoSubjectListSupplied_FallsBackToWholeClosure()
         {
+            Assert.Null(RunCommand.ReadSubjectAssemblyList(null));
+            Assert.Null(RunCommand.ReadSubjectAssemblyList("   "));
             Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], null));
-            Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], "   "));
         }
 
         [Fact]
-        public void MissingSubjectDir_FallsBackToWholeClosure()
+        public void MissingSubjectList_FallsBackToWholeClosure()
         {
-            string missing = Path.Combine(Path.GetTempPath(), "versioning-runner-no-such-dir-" + Guid.NewGuid());
-            Assert.Null(RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], missing));
+            string missing = Path.Combine(Path.GetTempPath(), "versioning-runner-no-such-list-" + Guid.NewGuid());
+            Assert.Null(RunCommand.ReadSubjectAssemblyList(missing));
         }
 
         [Fact]
-        public void SubjectDirNamingALoadedAssembly_YieldsThatAssemblysNamespaces()
+        public void EmptySubjectList_IsNotTheSameAsNoList()
+        {
+            // Null means nobody said which assemblies are the subject's, so attribution widens
+            // to the whole closure. Empty means the caller looked and the build staged nothing,
+            // which the caller fails on before this point. Collapsing the two would turn a
+            // build failure into a silent whole-closure report.
+            string list = Path.Combine(Path.GetTempPath(), "versioning-runner-list-" + Guid.NewGuid() + ".txt");
+            File.WriteAllText(list, "");
+            try
+            {
+                var names = RunCommand.ReadSubjectAssemblyList(list);
+
+                Assert.NotNull(names);
+                Assert.Empty(names!);
+            }
+            finally { File.Delete(list); }
+        }
+
+        [Fact]
+        public void SubjectListNamingALoadedAssembly_YieldsThatAssemblysNamespaces()
         {
             var asm = typeof(object).Assembly;
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            Directory.CreateDirectory(dir);
-            try
-            {
-                // Only the file name is used; the content is never loaded, because the
-                // namespaces come off the already-loaded assembly of the same name.
-                File.WriteAllText(Path.Combine(dir, Path.GetFileName(asm.Location)), "");
+            var names = RunCommand.ReadSubjectAssemblyListFrom([Path.GetFileName(asm.Location)]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([asm], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Contains("System.Collections.Generic", ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.Contains("System.Collections.Generic", ns);
         }
 
         [Fact]
-        public void SubjectAssemblyInATfmSubdirectory_IsFound()
+        public void SubjectListEntriesMayBeFullPaths()
         {
-            // SDK-style repos append the TFM to OutputPath, so the subject's assemblies sit
-            // in Build\<tfm>\ rather than Build\. A top-level-only scan silently produced an
-            // empty subject set, and an empty set means the check cannot fail.
+            // The caller writes names, but a full path is the obvious thing for someone to
+            // write later, and silently matching nothing would empty the subject set.
             var asm = typeof(object).Assembly;
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            string nested = Path.Combine(dir, "netstandard2.0");
-            Directory.CreateDirectory(nested);
-            try
-            {
-                File.WriteAllText(Path.Combine(nested, Path.GetFileName(asm.Location)), "");
+            var names = RunCommand.ReadSubjectAssemblyListFrom([asm.Location]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([asm], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Contains("System.Collections.Generic", ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.Contains("System.Collections.Generic", ns);
         }
 
         [Fact]
-        public void SubjectDirNamingNothingLoaded_YieldsNoNamespacesRatherThanTheClosure()
+        public void SubjectListIsCaseInsensitive()
         {
-            string dir = Path.Combine(Path.GetTempPath(), "versioning-runner-subject-" + Guid.NewGuid());
-            Directory.CreateDirectory(dir);
-            try
-            {
-                File.WriteAllText(Path.Combine(dir, "Nothing_Built_Here.dll"), "");
+            var asm = typeof(object).Assembly;
+            var names = RunCommand.ReadSubjectAssemblyListFrom([Path.GetFileName(asm.Location).ToUpperInvariant()]);
 
-                var ns = RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], dir);
+            var ns = RunCommand.BuildSubjectNamespaces([asm], names);
 
-                Assert.NotNull(ns);
-                Assert.Empty(ns);
-            }
-            finally { Directory.Delete(dir, recursive: true); }
+            Assert.NotNull(ns);
+            Assert.NotEmpty(ns!);
+        }
+
+        [Fact]
+        public void SubjectListNamingNothingLoaded_YieldsNoNamespacesRatherThanTheClosure()
+        {
+            var names = RunCommand.ReadSubjectAssemblyListFrom(["Nothing_Built_Here.dll"]);
+
+            var ns = RunCommand.BuildSubjectNamespaces([typeof(object).Assembly], names);
+
+            Assert.NotNull(ns);
+            Assert.Empty(ns);
         }
 
         // Strings below are copied verbatim from a real run's EventMessages.
