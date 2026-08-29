@@ -8,10 +8,21 @@ public static class CompareCommand
 {
     // POLICY VALUE, NOT A MEASUREMENT. The share of the tested population that must fail on
     // the base branch before we refuse to diff against it. Set by CI ownership, not derived
-    // from anything. Observed failure rate at time of writing: 99.3% (5981 of 6024 on
-    // a private Revit tool repo), so anything from roughly 0.25 to 0.90 behaves identically
-    // today. Overridable per-repo via the ci-serialisation action's
+    // from anything. Overridable per-repo via the ci-serialisation action's
     // implausible_baseline_ratio input; change it there, not here.
+    //
+    // HISTORICAL: the 99.3% failure rate (5981 of 6024) this value was originally chosen
+    // against was the pre-fix serialiser, and the defect behind it was fixed on 2026-08-03 by
+    // the System.Drawing.Common reference in SerialiserRunner.csproj. Healthy baselines since
+    // then report at or near zero failures over a population of roughly six thousand.
+    //
+    // Any value from roughly 0.25 to 0.90 therefore behaves identically on everything observed
+    // so far, but the reason is not that intermediate baselines are impossible. It is that the
+    // only two states seen to date sit at opposite ends of that band: near 0% with a healthy
+    // serialiser, near 100% with a globally broken one. Intermediate states are reachable:
+    // failures and population are summed across three independent converter legs, so a defect
+    // confined to one of them lands in the low tens of percent. Choosing inside the band is a
+    // choice about which partial states to refuse, not a free one.
     public const double DefaultImplausibleBaselineRatio = 0.5;
 
     public static CompareResult Compare(SerialiserResult baseline, SerialiserResult branch,
