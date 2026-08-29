@@ -49,9 +49,14 @@ inputs:
       serialisation on the base branch before the check refuses to diff against it and
       reports "baseline unusable" instead of naming affected types. A baseline that broken
       cannot establish what the branch changed, so any diff against it is meaningless.
-      Set by CI ownership. Observed failure rate at time of writing: 99.3% (5981 of 6024
-      on a private Revit tool repo), so anything from roughly 0.25 to 0.90 behaves identically
-      today. Raise or lower here rather than in CompareCommand.cs.
+      Set by CI ownership. HISTORICAL: the 99.3% failure rate (5981 of 6024) this value was
+      originally chosen against was the pre-fix serialiser, and the defect behind it was fixed
+      on 2026-08-03; healthy baselines since then report at or near zero failures over a
+      population of roughly six thousand. Any value from roughly 0.25 to 0.90 behaves
+      identically on everything observed so far, but only because the two states seen to date
+      sit at opposite ends of that band, not because intermediate baselines cannot occur.
+      A defect confined to one of the three converter legs lands in the low tens of percent.
+      Raise or lower here rather than in CompareCommand.cs.
     required: false
     default: '0.5'
 
