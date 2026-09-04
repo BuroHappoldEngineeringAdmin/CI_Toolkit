@@ -255,5 +255,72 @@ namespace VersioningRunner.Tests
                 Assert.Equal(AttributionBasis.DeclaringAssembly, Assert.Single(diags).AttributedBy);
             }
         }
+
+        // A lost subject set must stay Error. It is a precondition failure, not a finding, and
+        // the "do not gate on inferred attribution" policy must not reach it.
+        //
+        // Why this needs pinning. When no subject assembly list is supplied or the file is
+        // absent, ReadSubjectAssemblyList returns null, BuildSubjectNamespaces returns null and
+        // attribution falls back to the whole loaded closure, which over-reports massively:
+        // measured at 1056 of 1056 findings belonging to other repositories. That path records
+        // AttributionBasis.NotRecorded, and the policy keys on NamespaceFallback, so the two do
+        // not collide and the over-reporting run still fails. That safety is incidental rather
+        // than designed: both paths are "match the description against a set of namespaces", so
+        // unifying them is a natural-looking refactor, and doing so without noticing would
+        // silently convert the whole-closure red into a green tick. These tests fail if that
+        // happens.
+        //
+        // Observed on BHoM/Versioning_Toolkit PR #348, run 33619426914: the action's own guard
+        // caught the missing list and exited 1 before the runner started, so this is defence in
+        // depth behind that guard, not the only protection.
+        public class WhenTheSubjectSetIsLost
+        {
+            // The three-segment prefix set the whole-closure path matches on.
+            private static readonly HashSet<string> LoadedPrefixes =
+                new(["BH.Adapter.ETABS", "BH.oM.Structure.Elements"], StringComparer.Ordinal);
+
+            private static (VersioningResult Result, List<FailureDiagnostic> Diags,
+                            List<RunCommand.UnverifiedFailure> Unverified) RunWholeClosure(FakeTestResult tree)
+            {
+                var diagnostics = new List<FailureDiagnostic>();
+                var unverified = new List<RunCommand.UnverifiedFailure>();
+                var result = RunCommand.ExtractFilteredResult(
+                    tree,
+                    // Exactly the lambda RunCommand.Execute installs when subjectNamespaces is null.
+                    (d, _) => (RunCommand.IsFromLoadedNamespace(d, LoadedPrefixes), AttributionBasis.NotRecorded),
+                    unverified,
+                    (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()),
+                    diagnostics, closure: null);
+                return (result, diagnostics, unverified);
+            }
+
+            [Fact]
+            public void WholeClosureFindingWithNoMethodEvent_StillCountsAsRealAndStillGates()
+            {
+                var (result, diags, unverified) = RunWholeClosure(
+                    Tree("BH.Adapter.ETABS.ETABSAdapter..ctor"));
+
+                // No method event, so no declaring assembly — the same input shape that routes
+                // to the unverified bucket under subject attribution. Here it must not.
+                Assert.Equal(1, result.FailureCount);
+                Assert.Empty(unverified);
+
+                var only = Assert.Single(diags);
+                Assert.Equal(AttributionBasis.NotRecorded, only.AttributedBy);
+                Assert.True(only.CountedAsReal);
+                Assert.Null(only.Cause);
+
+                Assert.Equal(VersioningStatus.Error,
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count));
+                Assert.Equal(1, RunCommand.ExitCodeFor(
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count)));
+            }
+
+            // The policy is keyed on the basis and nothing else, so state that directly: these
+            // are distinct enum values and NotRecorded is not the fallback.
+            [Fact]
+            public void WholeClosureBasisIsNotTheNamespaceFallback()
+                => Assert.NotEqual(AttributionBasis.NamespaceFallback, AttributionBasis.NotRecorded);
+        }
     }
 }
