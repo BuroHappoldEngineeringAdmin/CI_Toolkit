@@ -610,6 +610,49 @@ namespace VersioningRunner.Tests
             Assert.Null(RunCommand.ClassifyUnresolvableCause([ConvertCause], LoadedTypeIndex.Empty).Cause);
         }
 
+        // The two reasons a finding goes unverified are different axes and must not collapse
+        // into one number. Measured cost of collapsing them: on BHoM/BHoM run 33849699768 two
+        // warnings both opened with "145 failure(s)" — one the unverified total, the other the
+        // count attributed by namespace — and the split was read as 0/145 when it was 114/31.
+        private static FailureDiagnostic Diag(string label, ClassificationPath path, bool real) =>
+            new(label, real, path, real ? null : "cause", null, null, 0);
+
+        [Fact]
+        public void UnverifiedBasis_SplitsByReasonAndAlwaysSumsToTheUnverifiedTotal()
+        {
+            var diags = new[]
+            {
+                Diag("a", ClassificationPath.UnresolvableTypeAbsent, false),
+                Diag("b", ClassificationPath.UnresolvableTypeAbsent, false),
+                Diag("c", ClassificationPath.UnresolvableFromEvents, false),
+                Diag("d", ClassificationPath.NoMethodEvent, false),
+                Diag("e", ClassificationPath.NoMethodEvent, true),   // real: counts in neither
+            };
+
+            var (unresolvable, unattributable) = RunCommand.UnverifiedBasis(diags);
+
+            Assert.Equal(3, unresolvable);
+            Assert.Equal(1, unattributable);
+            Assert.Equal(diags.Count(d => !d.CountedAsReal), unresolvable + unattributable);
+        }
+
+        // A path added later must not fall out of the report entirely. Because unattributable
+        // is derived by subtraction it lands there and is visible, rather than in neither.
+        [Fact]
+        public void UnverifiedBasis_AnUnknownUnverifiedPath_IsNotSilentlyDropped()
+        {
+            var diags = new[] { Diag("x", ClassificationPath.ConfigurationNotBuilt, false) };
+
+            var (unresolvable, unattributable) = RunCommand.UnverifiedBasis(diags);
+
+            Assert.Equal(0, unresolvable);
+            Assert.Equal(1, unattributable);
+        }
+
+        [Fact]
+        public void UnverifiedBasis_NoDiagnostics_IsZeroZeroRatherThanUndefined()
+            => Assert.Equal((0, 0), RunCommand.UnverifiedBasis(Array.Empty<FailureDiagnostic>()));
+
         [Fact]
         public void NamedFailingType_ParsesAllThreeEventShapes()
         {

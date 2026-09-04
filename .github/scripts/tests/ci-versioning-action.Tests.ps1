@@ -81,6 +81,30 @@ Describe 'ci-versioning action.yml' {
         }
     }
 
+    Context 'the unverified breakdown is reported unconditionally' {
+
+        # A silent zero cannot be told from a number nobody measured. Same trap as the
+        # attribution-basis print that used to be gated on being non-zero, and the reason
+        # run 33849699768's 114/31 split was read as 0/145.
+        It 'prints both breakdown rows without gating them on a non-zero total' {
+            $summary = ($text -split '- name: Write to Job Summary' | Select-Object -Last 1)
+            $summary | Should -Match 'could not be resolved \(closure gap\)'
+            $summary | Should -Match 'could not be attributed \(inferred ownership\)'
+            # Tested by contiguity rather than by absence of any 'if': #17 legitimately uses
+            # elseif ($unverified -gt 0) further down for the findings-table prose. What must
+            # hold is that nothing branches between the total and its two components.
+            $between = [regex]::Match($text,
+                '(?s)Reported unverified.*?could not be attributed \(inferred ownership\)').Value
+            $between | Should -Not -Match 'if \(' `
+                -Because 'a branch between the total and its breakdown reintroduces the silent zero'
+        }
+
+        It 'surfaces both axes, not just attribution' {
+            $text | Should -Match 'Unverified basis'   -Because 'the classification axis'
+            $text | Should -Match 'Attribution basis'  -Because 'the ownership axis'
+        }
+    }
+
     Context 'the subject-assembly bracket' {
 
         # The subject set is the difference between two snapshots of the shared assembly

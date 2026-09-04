@@ -796,12 +796,17 @@ runs:
         # ::warning, but stderr is deliberately not teed into the file this summary reads
         # (see the tee step), so without this line the summary would not carry it at all.
         $attributionBasis = '(not reported)'
+        $unverifiedBasis = '(not reported)'
         if (Test-Path 'versioning-stdout.txt') {
           $out = Get-Content 'versioning-stdout.txt' -Raw
           # 'Attribution basis:' does not contain 'Attribution:', so these cannot cross-match.
           if ($out -match 'Attribution:\s*(.+)')       { $attribution      = $Matches[1].Trim() }
           if ($out -match 'Classification:\s*(.+)')    { $classification   = $Matches[1].Trim() }
           if ($out -match 'Attribution basis:\s*(.+)') { $attributionBasis = $Matches[1].Trim() }
+          # 'Unverified basis:' is the classification axis; 'Attribution basis:' is the
+          # ownership axis. Both are surfaced because reading either alone invites the
+          # reader to treat it as the whole picture.
+          if ($out -match 'Unverified basis:\s*(.+)')  { $unverifiedBasis  = $Matches[1].Trim() }
         }
 
         $rows = @()
@@ -866,11 +871,13 @@ runs:
         $md += "|---|---|"
         $md += "| Classification | ``$classification`` |"
         $md += "| Attribution basis | ``$attributionBasis`` |"
+        $md += "| Unverified basis | ``$unverifiedBasis`` |"
+        # Both rows print even when zero. A silent zero cannot be told from a number
+        # nobody measured, which is the same trap as the attribution-basis line that used
+        # to be gated on being non-zero.
         $md += "| Reported unverified | $unverified |"
-        if ($unverified -gt 0) {
-          $md += "| — could not be resolved (closure gap) | $unresolved |"
-          $md += "| — could not be attributed (inferred ownership) | $unattributed |"
-        }
+        $md += "| — could not be resolved (closure gap) | $unresolved |"
+        $md += "| — could not be attributed (inferred ownership) | $unattributed |"
         if ($coverage) {
           $md += "| Surface examined | $($coverage.SubjectTypes) subject types across $($coverage.SubjectAssemblies) subject assemblies |"
           $md += "| Dataset versions | $(if ($coverage.DatasetVersions -eq 0) { 'all staged' } else { 'previous only' }) |"
