@@ -208,19 +208,36 @@ public static class RunCommand
                 $"Attribution basis: {byAssembly} by declaring assembly, "
                 + $"{byNamespace} by namespace fallback (no declaring assembly recorded)");
 
+            // Why each finding went unverified, printed unconditionally and next to the
+            // attribution basis, because the two are different axes and reporting only one of
+            // them invites the reader to collapse them.
+            //
+            // Measured cost of not doing this: on run 33849699768 the two warnings below both
+            // opened with "145 failure(s)" — one the total unverified, the other the count
+            // attributed by namespace — and were read as "0 classified by resolution, 145 by
+            // attribution". The real split was 114 and 31. Correct numbers, wrong conclusion,
+            // because nothing said which axis either was measuring.
+            var (unresolvable, unattributable) = UnverifiedBasis(diagnostics);
+            Console.WriteLine(
+                $"Unverified basis: {unresolvable} unresolvable (a type the record needs is absent "
+                + $"from the closure), {unattributable} unattributable (ownership inferred from a namespace prefix)");
+
             // The fallback cannot tell this repository's namespace from a namespace it is
             // merely the root of, so any finding on that path may be another repository's.
-            // Those findings no longer gate: they are routed to the unverified bucket at
-            // classification, so this reports how much of the run went unverified for that
-            // reason rather than how much of a red was guesswork.
+            //
+            // Deliberately does NOT lead with a count of findings. It is a statement about the
+            // attribution basis of findings that may have been classified for an entirely
+            // different reason, and phrasing it as "N failure(s)" is what made it read as a
+            // classification total.
             if (byNamespace > 0)
             {
                 Console.Error.WriteLine(
-                    $"::warning title=Versioning::{byNamespace} failure(s) could only be attributed to this repository by "
-                    + "namespace, because the dataset record named no declaring assembly. That test cannot separate "
-                    + "this repository's types from those of repositories extending its namespace, so they are reported "
-                    + "as unverified and do not fail this check. A genuine regression among them would not be detected "
-                    + "this run. See BHoM/internal-tickets#31.");
+                    $"::warning title=Versioning::Attribution basis, not a finding count: {byNamespace} of "
+                    + $"{diagnostics.Count} finding(s) named no declaring assembly, so ownership could only be inferred "
+                    + "from a namespace prefix, which cannot separate this repository's types from those of repositories "
+                    + $"extending its namespace. Of those, {unresolvable} were separately unverifiable because the closure "
+                    + $"could not resolve a type they need and are reported under that cause; {unattributable} rest on the "
+                    + "inference alone. None of them gate. See BHoM/internal-tickets#31.");
             }
         }
 
@@ -243,8 +260,10 @@ public static class RunCommand
             // longer true of all of them: inferred ownership lands here too, and those types
             // are resolvable and may well be BHoM's.
             Console.Error.WriteLine(
-                $"::warning title=Versioning::{unresolvableSkips.Count} failure(s) attributed to this repo were not verified: " +
+                $"::warning title=Versioning::{unresolvableSkips.Count} finding(s) attributed to this repo were not verified, " +
+                $"for {causes.Count} distinct reason(s): " +
                 $"{string.Join(", ", causes.Take(8))}{(causes.Count > 8 ? $" and {causes.Count - 8} more" : "")}. " +
+                "See the Unverified basis line for the split between unresolvable and unattributable. " +
                 "A genuine versioning regression among them would not be detected this run.");
         }
 
@@ -333,6 +352,25 @@ public static class RunCommand
         }
 
         return ExitCodeFor(result.Status);
+    }
+
+    // Splits the unverified bucket by why, not by whose. The two reasons need different
+    // work — a closure gap is fixed by resolving more, inferred ownership by knowing more —
+    // so a single total is not actionable.
+    //
+    // Unresolvable is defined by the classification path rather than by subtraction, and
+    // unattributable by subtraction from the unverified total, so the two always sum to it
+    // and a new unverified path cannot silently vanish from the report: it lands in
+    // unattributable and shows up as a number nobody expected, rather than in neither.
+    internal static (int Unresolvable, int Unattributable) UnverifiedBasis(
+        IEnumerable<FailureDiagnostic> diagnostics)
+    {
+        var all = diagnostics as ICollection<FailureDiagnostic> ?? diagnostics.ToList();
+        int unresolvable = all.Count(d => !d.CountedAsReal
+            && d.Path is ClassificationPath.UnresolvableTypeAbsent
+                      or ClassificationPath.UnresolvableFromEvents);
+        int unverified = all.Count(d => !d.CountedAsReal);
+        return (unresolvable, unverified - unresolvable);
     }
 
     // The check's verdict, from the two counts that decide it.
