@@ -61,6 +61,24 @@ Describe 'ci-versioning action.yml' {
             $text.Contains("`$listPath = '$artefact'")           | Should -BeTrue -Because 'the guard reads it'
             $text.Contains("--subject-assembly-list '$artefact'") | Should -BeTrue -Because 'the runner is given it'
         }
+
+        # The two guard branches above only mean different things if the file is always
+        # written. Piping an empty array to Set-Content never invokes its process block and
+        # leaves no file (measured), so an empty subject set arrives at the reader as an
+        # absent one and the "did not run" branch fires for a step that ran. Measured on
+        # BHoM/Versioning_Toolkit PR #348, run 33619426914.
+        #
+        # Asserted on the -Value form rather than on behaviour because this file is text
+        # under test, not an executed script. Reverting to a pipe is the specific regression
+        # this catches, and it looks harmless.
+        It 'writes the subject list unconditionally, so absent and empty stay distinguishable' {
+            $collect = ($text -split '- name: Collect subject assemblies' | Select-Object -Last 1)
+            $collect = ($collect -split '- name: ')[0]
+            $collect | Should -Match "Set-Content -Path 'subject-assemblies\.txt' -Value \`$subject" `
+                -Because 'an empty pipeline into Set-Content writes no file, which makes the guard misreport'
+            $collect | Should -Not -Match "\`$subject \| Set-Content" `
+                -Because 'the pipe form is the regression: it leaves no file when the build stages nothing'
+        }
     }
 
     Context 'the subject-assembly bracket' {
