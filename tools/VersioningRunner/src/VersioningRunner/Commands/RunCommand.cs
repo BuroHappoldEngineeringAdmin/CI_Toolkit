@@ -184,29 +184,38 @@ public static class RunCommand
             if (noAssembly > 0)
                 Console.WriteLine($"Real failures with no declaring assembly recorded: {noAssembly}");
 
-            // How each attributed failure was decided to be ours. Reported unconditionally
-            // because the interesting number is the fallback count, and a number that is only
-            // printed when it is non-zero cannot be distinguished from one nobody measured.
+            // How each attributed failure was decided to be ours. Printed whenever there are
+            // diagnostics at all, including when both counts are zero, because the interesting
+            // number is the fallback count and a number that only appears when it is non-zero
+            // cannot be distinguished from one nobody measured. The enclosing
+            // diagnostics.Count > 0 is the only guard: with no attributed findings there is
+            // nothing to report a basis for.
+            //
+            // This used to carry the comment above while guarding the print on
+            // byAssembly + byNamespace > 0, which produced exactly the state the comment warned
+            // against. A sweep of all 62 repositories carrying ci-beta.yml could not tell a
+            // repository with no fallback attributions from one that had never run the check,
+            // and establishing that BHoM/BHoM was the only affected repository took a log sweep
+            // rather than a glance at each run.
             int byAssembly = diagnostics.Count(d => d.AttributedBy == AttributionBasis.DeclaringAssembly);
             int byNamespace = diagnostics.Count(d => d.AttributedBy == AttributionBasis.NamespaceFallback);
-            if (byAssembly + byNamespace > 0)
-            {
-                Console.WriteLine(
-                    $"Attribution basis: {byAssembly} by declaring assembly, "
-                    + $"{byNamespace} by namespace fallback (no declaring assembly recorded)");
+            Console.WriteLine(
+                $"Attribution basis: {byAssembly} by declaring assembly, "
+                + $"{byNamespace} by namespace fallback (no declaring assembly recorded)");
 
-                // The fallback cannot tell this repository's namespace from a namespace it is
-                // merely the root of, so any finding on that path may be another repository's.
-                // Warned rather than logged: it is the residue of a known defect, and the
-                // point of counting it is that someone notices when it stops being zero.
-                if (byNamespace > 0)
-                {
-                    Console.Error.WriteLine(
-                        $"::warning title=Versioning::{byNamespace} failure(s) were attributed to this repository by "
-                        + "namespace because the dataset record named no declaring assembly. That test cannot separate "
-                        + "this repository's types from those of repositories extending its namespace, so these "
-                        + "specific findings may not be its own.");
-                }
+            // The fallback cannot tell this repository's namespace from a namespace it is
+            // merely the root of, so any finding on that path may be another repository's.
+            // Those findings no longer gate: they are routed to the unverified bucket at
+            // classification, so this reports how much of the run went unverified for that
+            // reason rather than how much of a red was guesswork.
+            if (byNamespace > 0)
+            {
+                Console.Error.WriteLine(
+                    $"::warning title=Versioning::{byNamespace} failure(s) could only be attributed to this repository by "
+                    + "namespace, because the dataset record named no declaring assembly. That test cannot separate "
+                    + "this repository's types from those of repositories extending its namespace, so they are reported "
+                    + "as unverified and do not fail this check. A genuine regression among them would not be detected "
+                    + "this run. See BHoM/internal-tickets#31.");
             }
         }
 
@@ -223,11 +232,15 @@ public static class RunCommand
                 .Distinct(StringComparer.Ordinal)
                 .OrderBy(c => c, StringComparer.Ordinal)
                 .ToList();
+            // The cause list carries the reason, so this no longer asserts one. It previously
+            // said the types that failed to deserialise were "outside BHoM and cannot be
+            // resolved in CI", which was true of every cause this bucket then held and is no
+            // longer true of all of them: inferred ownership lands here too, and those types
+            // are resolvable and may well be BHoM's.
             Console.Error.WriteLine(
-                $"::warning title=Versioning::{unresolvableSkips.Count} failure(s) attributed to this repo were not verified, " +
-                "because the only types that failed to deserialise are outside BHoM and cannot be resolved in CI: " +
+                $"::warning title=Versioning::{unresolvableSkips.Count} failure(s) attributed to this repo were not verified: " +
                 $"{string.Join(", ", causes.Take(8))}{(causes.Count > 8 ? $" and {causes.Count - 8} more" : "")}. " +
-                "A genuine versioning regression in those same methods would not be detected this run.");
+                "A genuine versioning regression among them would not be detected this run.");
         }
 
         var status = DeriveStatus(allFailures.Count, unresolvableSkips.Count);
@@ -576,6 +589,34 @@ public static class RunCommand
                 // finding is left real. Ordering matters: folding this into the condition
                 // above makes the branch unreachable, which is how v1 lost it.
             }
+
+            // Attribution policy: a finding whose ownership was inferred must not gate.
+            //
+            // AttributeToSubject falls back to a namespace prefix when the dataset record
+            // names no declaring assembly. That answer is a guess, and the code below it
+            // has always said so — the run warns that "these specific findings may not be
+            // its own" and then failed the build on them anyway. Recording the uncertainty
+            // and discarding it is the defect; the fallback itself is fine, because a
+            // prefix is genuinely all the evidence there is on that path.
+            //
+            // No namespace rule can be made correct here, so precision is not the fix:
+            // BH.oM.Structure.Elements is declared by both BHoM/BHoM and
+            // StructuralEngineering_Toolkit, and a string cannot say which of two repos
+            // sharing a namespace owns a type. Measured on BHoM/BHoM (run 33849699768,
+            // commit d6db0a1): 145 of 145 findings arrived on this path and 0 by declaring
+            // assembly, and 145 of 145 turned out to be another repository's or an artefact
+            // of an incomplete closure. Re-running the same subject against a closure with
+            // 186 assemblies loaded instead of 75 cut the count to 98 and left the basis at
+            // 100% inferred, so closure quality changes the volume and never the basis.
+            //
+            // Routed to the unverified bucket rather than dropped, because dropping would
+            // lose a real regression that happens to sit on this path. DeriveStatus then
+            // yields Warning and ExitCodeFor yields 0: still in the log, still in the
+            // artefact, no longer a gate. See BHoM/internal-tickets#31.
+            if (cause is null && attributedBy == AttributionBasis.NamespaceFallback)
+                cause = "ownership inferred from a namespace prefix, because the dataset "
+                    + "record named no declaring assembly, so this finding may belong to "
+                    + "another repository extending the same namespace";
 
             if (cause is not null)
                 unresolvableSkips?.Add(new UnverifiedFailure(label, cause));
