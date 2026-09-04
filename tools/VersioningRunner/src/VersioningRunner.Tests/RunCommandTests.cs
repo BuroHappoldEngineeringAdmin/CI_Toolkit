@@ -521,36 +521,113 @@ namespace VersioningRunner.Tests
         private const string MethodCause =
             "Method ApplyDuctInsulation from { \"_t\" : \"System.Type\", \"Name\" : \"BH.Revit.Engine.MechanicalPlumbing.Compute, Revit_MechanicalPlumbing_Engine_2022, Version=9.0.0.0, Culture=neutral, PublicKeyToken=null\", \"_bhomVersion\" : \"9.2\" } failed to deserialise.";
 
+        // The object-record shapes, also verbatim from a real run (BHoM/BHoM 33849699768).
+        // A nested fragment from a downstream toolkit names itself here.
+        private const string ConvertCause =
+            "Failed to convert the string into a type: BH.oM.Adapters.GSA.MaterialFragments.Fabric";
+        private const string UnknownCause =
+            "The type BH.oM.Adapters.GSA.MaterialFragments.Fabric from version 9.2 is unknown -> data returned as custom objects.";
+
+        // A closure holding Structure_oM: the namespace is present, so a type missing from
+        // it is a removal rather than a gap. GSA is absent entirely.
+        private static LoadedTypeIndex StructureOnly() => new(
+            new HashSet<string>(["BH.oM.Structure.Elements.Panel", "BH.oM.Structure.Elements.Edge"], StringComparer.Ordinal),
+            new HashSet<string>(["BH.oM.Structure.Elements"], StringComparer.Ordinal));
+
         [Fact]
         public void OnlyNonBHoMTypesFailed_IsClassifiedUnresolvable()
         {
             Assert.Equal("Autodesk.Revit.DB.Document",
-                RunCommand.ClassifyUnresolvableCause([RevitCause, MethodCause]));
+                RunCommand.ClassifyUnresolvableCause([RevitCause, MethodCause], StructureOnly()).Cause);
         }
 
         [Fact]
         public void MethodEventEmbeddingABHoMTypeInJson_DoesNotCountAsATypeFailure()
         {
-            // The Method event embeds a BH. type in its JSON payload. Only "Type ..."
-            // events name what failed, or every Revit failure would read as real.
-            Assert.NotNull(RunCommand.ClassifyUnresolvableCause([RevitCause, MethodCause]));
+            // The Method event embeds a BH. type in its JSON payload. Only the type-naming
+            // shapes say what failed, or every Revit failure would read as real.
+            Assert.NotNull(RunCommand.ClassifyUnresolvableCause([RevitCause, MethodCause], StructureOnly()).Cause);
         }
 
+        // The removal fail-safe, and the reason this is keyed on the loaded set rather than
+        // on absence alone. Bar is gone from an assembly that IS loaded and whose namespace
+        // survives, so it is a removal and must stay real. Classifying it away would make the
+        // check blind to exactly what it exists to catch.
         [Fact]
-        public void ABHoMTypeAmongTheFailures_IsReal()
+        public void TypeMissingFromALoadedNamespace_IsReal()
         {
             Assert.Null(RunCommand.ClassifyUnresolvableCause([
                 RevitCause,
                 "Type BH.oM.Structure.Elements.Bar, Structure_oM, Version=9.0.0.0 failed to deserialise.",
-                MethodCause]));
+                MethodCause], StructureOnly()).Cause);
+        }
+
+        // The case the old `StartsWith("BH.")` test got wrong, and the whole point of the
+        // change. This type is another repository's, its namespace is nowhere in the closure,
+        // and it starts with BH. — so the old test called it real and failed the build on it.
+        [Theory]
+        [InlineData(ConvertCause)]
+        [InlineData(UnknownCause)]
+        public void BHoMTypeWhoseNamespaceIsNotLoadedAtAll_IsUnresolvable(string message)
+        {
+            var (cause, fromPayload) = RunCommand.ClassifyUnresolvableCause([message], StructureOnly());
+            Assert.Equal("BH.oM.Adapters.GSA.MaterialFragments.Fabric", cause);
+            Assert.True(fromPayload, "a payload-shaped message must record UnresolvableTypeAbsent, not the signature path");
+        }
+
+        // Mixed: one removal, one closure gap. The removal outranks, because losing a real
+        // regression is the worse error and the removed type has its own record besides.
+        [Fact]
+        public void ARemovalAlongsideAClosureGap_StaysReal()
+        {
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([
+                ConvertCause,
+                "Failed to convert the string into a type: BH.oM.Structure.Elements.Bar"], StructureOnly()).Cause);
+        }
+
+        [Fact]
+        public void TypePresentInTheLoadedSet_IsNotABlocker()
+        {
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([
+                "Failed to convert the string into a type: BH.oM.Structure.Elements.Panel"], StructureOnly()).Cause);
         }
 
         [Fact]
         public void NoTypeEventsAtAll_IsReal()
         {
-            Assert.Null(RunCommand.ClassifyUnresolvableCause([MethodCause]));
-            Assert.Null(RunCommand.ClassifyUnresolvableCause([]));
-            Assert.Null(RunCommand.ClassifyUnresolvableCause(["", "   "]));
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([MethodCause], StructureOnly()).Cause);
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([], StructureOnly()).Cause);
+            Assert.Null(RunCommand.ClassifyUnresolvableCause(["", "   "], StructureOnly()).Cause);
+        }
+
+        // An absent index means the caller is not exercising resolution. Decline rather than
+        // guess: with nothing known to be loaded, every named type looks absent, and
+        // reclassifying on that would silently disarm the check.
+        [Fact]
+        public void EmptyIndex_DeclinesToClassify()
+        {
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([RevitCause], LoadedTypeIndex.Empty).Cause);
+            Assert.Null(RunCommand.ClassifyUnresolvableCause([ConvertCause], LoadedTypeIndex.Empty).Cause);
+        }
+
+        [Fact]
+        public void NamedFailingType_ParsesAllThreeEventShapes()
+        {
+            Assert.Equal("Autodesk.Revit.DB.Document", RunCommand.NamedFailingType(RevitCause));
+            Assert.Equal("BH.oM.Adapters.GSA.MaterialFragments.Fabric", RunCommand.NamedFailingType(ConvertCause));
+            Assert.Equal("BH.oM.Adapters.GSA.MaterialFragments.Fabric", RunCommand.NamedFailingType(UnknownCause));
+            Assert.Null(RunCommand.NamedFailingType(MethodCause));
+            Assert.Null(RunCommand.NamedFailingType(""));
+        }
+
+        // "from version unknown" occurs on nested records; the version clause must still be
+        // cut or the type name carries it and never matches the loaded set.
+        [Fact]
+        public void UnknownShapeWithUnknownVersion_StillYieldsTheBareType()
+        {
+            Assert.Equal("BH.oM.Adapters.Sharepoint.Requests.OrCondition",
+                RunCommand.NamedFailingType(
+                    "The type BH.oM.Adapters.Sharepoint.Requests.OrCondition from version unknown is unknown -> data returned as custom objects."));
         }
 
         [Fact]
@@ -569,7 +646,8 @@ namespace VersioningRunner.Tests
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
             var skips = new List<RunCommand.UnverifiedFailure>();
-            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips,
+                typeIndex: RunCommand.BuildLoadedTypeIndex([typeof(RunCommand).Assembly]));
 
             Assert.Equal(VersioningStatus.Pass, result.Status);
             Assert.Equal(0, result.FailureCount);
@@ -778,7 +856,8 @@ namespace VersioningRunner.Tests
         {
             var diagnostics = new List<FailureDiagnostic>();
             RunCommand.ExtractFilteredResult(Tree("BH.oM.Adapters.File.FileSettings", RevitCause),
-                (_, _) => (true, AttributionBasis.NotRecorded), null, null, diagnostics);
+                (_, _) => (true, AttributionBasis.NotRecorded), null, null, diagnostics,
+                typeIndex: RunCommand.BuildLoadedTypeIndex([typeof(RunCommand).Assembly]));
 
             var only = Assert.Single(diagnostics);
             Assert.False(only.CountedAsReal);
@@ -849,7 +928,8 @@ namespace VersioningRunner.Tests
             var versionSummary = new FakeTestResult { Status = "Error", Information = [leafReal, leafUnverified] };
             var outer = new FakeTestResult { Status = "Error", Information = [versionSummary] };
 
-            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips, null, diagnostics);
+            var result = RunCommand.ExtractFilteredResult(outer, (_, _) => (true, AttributionBasis.NotRecorded), skips, null, diagnostics,
+                typeIndex: RunCommand.BuildLoadedTypeIndex([typeof(RunCommand).Assembly]));
 
             Assert.Equal(1, result.FailureCount);
             Assert.Single(skips);
