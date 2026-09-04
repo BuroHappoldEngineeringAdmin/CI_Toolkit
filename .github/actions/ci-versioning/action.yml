@@ -789,10 +789,12 @@ runs:
         $unverified = 0
         $coverage = $null
         $configuration = $null
+        $status = $null
         if (Test-Path 'versioning-result.json') {
           $r = Get-Content 'versioning-result.json' -Raw | ConvertFrom-Json
           $coverage = $r.Coverage
           $configuration = $r.Configuration
+          $status = $r.Status
           foreach ($d in @($r.Diagnostics)) {
             if ($d.CountedAsReal) {
               # Context per finding. VersionConditional is tri-state: Unknown means the
@@ -812,8 +814,17 @@ runs:
           }
         }
 
-        $head = if ($failed) { "Versioning failed: $($rows.Count) regression(s)" }
-                else         { "Versioning passed" }
+        # Three outcomes, not two. exit_code cannot tell Warning from Pass because both are
+        # 0 by design (ExitCodeFor), so the heading reads the runner's own Status instead.
+        # Without this a run that substantiated nothing announced "Versioning passed": on
+        # BHoM/BHoM all 98 findings were attributed by namespace prefix, none could be
+        # verified, and the heading was indistinguishable from a clean run. The check
+        # conclusion is success either way, because a GHA job cannot emit neutral, so this
+        # line and the table below it are the only places the difference can show.
+        $head =
+          if     ($failed)               { "Versioning failed: $($rows.Count) regression(s)" }
+          elseif ($status -eq 'Warning') { "Versioning inconclusive: $unverified finding(s) reported, none verified" }
+          else                           { "Versioning passed" }
 
         $md = @("### $head", "")
         $md += "**Coverage.** Attribution: $attribution"
@@ -841,8 +852,16 @@ runs:
             $md += "| ``$($x.Label)`` | $($x.Path) | ``$($x.Cause)`` | $($x.Context) |"
           }
           if ($rows.Count -gt 25) { $md += "" ; $md += "$($rows.Count - 25) further finding(s) are in the ``versioning-result.json`` artefact." }
+        } elseif ($unverified -gt 0) {
+          # Distinguished from a genuine clean run on purpose. "No regressions" is true here
+          # and misleading on its own: nothing was checked that could have produced one.
+          $md += "**Nothing was verified.** $unverified finding(s) were reported and none could be"
+          $md += "attributed or verified, so none counted towards the verdict and this check did not fail."
+          $md += "See the attribution basis above for why. Each is listed with its own cause in the"
+          $md += "``versioning-result.json`` artefact. A genuine regression among them would not have"
+          $md += "been detected on this run."
         } else {
-          $md += "No methods counted as real regressions. Unverified methods are listed in the ``versioning-result.json`` artefact."
+          $md += "No findings, and nothing reported as unverified."
         }
 
         $md | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

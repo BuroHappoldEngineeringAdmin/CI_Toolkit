@@ -138,27 +138,29 @@ namespace VersioningRunner.Tests
 
         public class ThroughTheCollector
         {
-            private static (VersioningResult Result, List<FailureDiagnostic> Diags) Run(
+            private static (VersioningResult Result, List<FailureDiagnostic> Diags,
+                            List<RunCommand.UnverifiedFailure> Unverified) Run(
                 FakeTestResult tree, HashSet<string> namespaces, ClosureContext closure)
             {
                 var diagnostics = new List<FailureDiagnostic>();
+                var unverified = new List<RunCommand.UnverifiedFailure>();
                 var result = RunCommand.ExtractFilteredResult(
                     tree,
                     (d, a) => RunCommand.AttributeToSubject(d, a, namespaces, closure),
-                    new List<RunCommand.UnverifiedFailure>(),
+                    unverified,
                     // Nothing answered for the type: this is the DeclaringTypeNotLoaded shape
                     // all 47 observed findings had, and the shape whose existing reclassification
                     // gate deliberately refuses to act. Attribution must therefore stop it, and
                     // this asserts that it does rather than relying on the classifier.
                     (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()),
                     diagnostics, closure);
-                return (result, diagnostics);
+                return (result, diagnostics, unverified);
             }
 
             [Fact]
             public void ForeignFinding_IsDroppedAtAttributionRatherThanClassified()
             {
-                var (result, diags) = Run(
+                var (result, diags, _) = Run(
                     Tree("BH.Adapter.ETABS.ETABSAdapter..ctor",
                          MethodEvent("BH.Adapter.ETABS.ETABSAdapter", "ETABS_Adapter")),
                     AdapterNamespaces, AdapterClosure());
@@ -172,7 +174,7 @@ namespace VersioningRunner.Tests
             [Fact]
             public void SubjectFinding_SurvivesAndRecordsTheAssemblyAsItsBasis()
             {
-                var (result, diags) = Run(
+                var (result, diags, _) = Run(
                     Tree("BH.Adapter.BHoMAdapter.Push",
                          MethodEvent("BH.Adapter.BHoMAdapter", "BHoM_Adapter")),
                     AdapterNamespaces, AdapterClosure());
@@ -183,15 +185,50 @@ namespace VersioningRunner.Tests
 
             // The counter the run output reports has to be able to see this path, so the basis
             // is recorded on the row rather than inferred from the absence of an assembly.
+            //
+            // The finding is kept and reported, and is deliberately NOT counted as real: a
+            // prefix cannot say which of two repositories sharing a namespace owns a type, so
+            // the verdict must not rest on it. Asserted here rather than only on DeriveStatus
+            // because the routing is what makes the count zero, and a test on the status alone
+            // would still pass if the finding were dropped outright.
             [Fact]
-            public void FindingWithNoMethodEvent_IsRecordedAsTheFallbackBasis()
+            public void FindingWithNoMethodEvent_IsReportedUnverifiedAndDoesNotGate()
             {
-                var (result, diags) = Run(
+                var (result, diags, unverified) = Run(
                     Tree("BH.Adapter.BHoMAdapter.Push"),
                     AdapterNamespaces, AdapterClosure());
 
+                Assert.Equal(0, result.FailureCount);
+                Assert.Equal(VersioningStatus.Warning,
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count));
+                Assert.Equal(0, RunCommand.ExitCodeFor(
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count)));
+
+                // Not dropped: still one row, still labelled, with the basis and the reason on it.
+                var only = Assert.Single(diags);
+                Assert.Equal(AttributionBasis.NamespaceFallback, only.AttributedBy);
+                Assert.False(only.CountedAsReal);
+                Assert.Contains("inferred from a namespace prefix", only.Cause);
+                Assert.Equal("BH.Adapter.BHoMAdapter.Push", Assert.Single(unverified).Description);
+            }
+
+            // A declaring assembly outranks the policy above: it is read from the record rather
+            // than guessed, so a finding carrying one still gates. Without this, routing the
+            // fallback to the unverified bucket could be widened to everything and no test
+            // would notice the check had stopped failing altogether.
+            [Fact]
+            public void PolicyDoesNotDisarmFindingsAttributedByAssembly()
+            {
+                var (result, diags, unverified) = Run(
+                    Tree("BH.Adapter.BHoMAdapter.Push",
+                         MethodEvent("BH.Adapter.BHoMAdapter", "BHoM_Adapter")),
+                    AdapterNamespaces, AdapterClosure());
+
                 Assert.Equal(1, result.FailureCount);
-                Assert.Equal(AttributionBasis.NamespaceFallback, Assert.Single(diags).AttributedBy);
+                Assert.Empty(unverified);
+                Assert.True(Assert.Single(diags).CountedAsReal);
+                Assert.Equal(VersioningStatus.Error,
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count));
             }
 
             // The observed run in miniature: one of the subject's own failures among several
@@ -211,12 +248,79 @@ namespace VersioningRunner.Tests
                     ]
                 };
 
-                var (result, diags) = Run(outer, AdapterNamespaces, AdapterClosure());
+                var (result, diags, _) = Run(outer, AdapterNamespaces, AdapterClosure());
 
                 Assert.Equal(1, result.FailureCount);
                 Assert.Equal("BH.Adapter.BHoMAdapter.Push", Assert.Single(result.Failures).Description);
                 Assert.Equal(AttributionBasis.DeclaringAssembly, Assert.Single(diags).AttributedBy);
             }
+        }
+
+        // A lost subject set must stay Error. It is a precondition failure, not a finding, and
+        // the "do not gate on inferred attribution" policy must not reach it.
+        //
+        // Why this needs pinning. When no subject assembly list is supplied or the file is
+        // absent, ReadSubjectAssemblyList returns null, BuildSubjectNamespaces returns null and
+        // attribution falls back to the whole loaded closure, which over-reports massively:
+        // measured at 1056 of 1056 findings belonging to other repositories. That path records
+        // AttributionBasis.NotRecorded, and the policy keys on NamespaceFallback, so the two do
+        // not collide and the over-reporting run still fails. That safety is incidental rather
+        // than designed: both paths are "match the description against a set of namespaces", so
+        // unifying them is a natural-looking refactor, and doing so without noticing would
+        // silently convert the whole-closure red into a green tick. These tests fail if that
+        // happens.
+        //
+        // Observed on BHoM/Versioning_Toolkit PR #348, run 33619426914: the action's own guard
+        // caught the missing list and exited 1 before the runner started, so this is defence in
+        // depth behind that guard, not the only protection.
+        public class WhenTheSubjectSetIsLost
+        {
+            // The three-segment prefix set the whole-closure path matches on.
+            private static readonly HashSet<string> LoadedPrefixes =
+                new(["BH.Adapter.ETABS", "BH.oM.Structure.Elements"], StringComparer.Ordinal);
+
+            private static (VersioningResult Result, List<FailureDiagnostic> Diags,
+                            List<RunCommand.UnverifiedFailure> Unverified) RunWholeClosure(FakeTestResult tree)
+            {
+                var diagnostics = new List<FailureDiagnostic>();
+                var unverified = new List<RunCommand.UnverifiedFailure>();
+                var result = RunCommand.ExtractFilteredResult(
+                    tree,
+                    // Exactly the lambda RunCommand.Execute installs when subjectNamespaces is null.
+                    (d, _) => (RunCommand.IsFromLoadedNamespace(d, LoadedPrefixes), AttributionBasis.NotRecorded),
+                    unverified,
+                    (_, _, _) => (null, ClassificationPath.DeclaringTypeNotLoaded, Array.Empty<string>()),
+                    diagnostics, closure: null);
+                return (result, diagnostics, unverified);
+            }
+
+            [Fact]
+            public void WholeClosureFindingWithNoMethodEvent_StillCountsAsRealAndStillGates()
+            {
+                var (result, diags, unverified) = RunWholeClosure(
+                    Tree("BH.Adapter.ETABS.ETABSAdapter..ctor"));
+
+                // No method event, so no declaring assembly — the same input shape that routes
+                // to the unverified bucket under subject attribution. Here it must not.
+                Assert.Equal(1, result.FailureCount);
+                Assert.Empty(unverified);
+
+                var only = Assert.Single(diags);
+                Assert.Equal(AttributionBasis.NotRecorded, only.AttributedBy);
+                Assert.True(only.CountedAsReal);
+                Assert.Null(only.Cause);
+
+                Assert.Equal(VersioningStatus.Error,
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count));
+                Assert.Equal(1, RunCommand.ExitCodeFor(
+                    RunCommand.DeriveStatus(result.FailureCount, unverified.Count)));
+            }
+
+            // The policy is keyed on the basis and nothing else, so state that directly: these
+            // are distinct enum values and NotRecorded is not the fallback.
+            [Fact]
+            public void WholeClosureBasisIsNotTheNamespaceFallback()
+                => Assert.NotEqual(AttributionBasis.NamespaceFallback, AttributionBasis.NotRecorded);
         }
     }
 }
