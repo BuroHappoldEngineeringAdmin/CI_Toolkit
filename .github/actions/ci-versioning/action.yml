@@ -223,7 +223,15 @@ runs:
         # Alt configurations are inside the bracket on purpose. A Revit repository's
         # year-suffixed assemblies are its own code, so attributing failures in them to it is
         # correct, and excluding them would understate what the check covers.
-        $subject | Set-Content -Path 'subject-assemblies.txt' -Encoding utf8
+        #
+        # -Value rather than a pipe, so the file is written even when $subject is empty.
+        # Piping an empty array never invokes Set-Content's process block and leaves no file
+        # at all (measured), which collapses two different states into one for the reader:
+        # "this step never ran" and "this step ran and the build staged nothing" both present
+        # as an absent file. The validate step below has a correct message for the second and
+        # could never reach it. Measured on BHoM/Versioning_Toolkit PR #348, run 33619426914:
+        # the build succeeded, this step ran, and the check reported that it had not.
+        Set-Content -Path 'subject-assemblies.txt' -Value $subject -Encoding utf8
         Write-Host "Subject assemblies staged by this repository's build: $($subject.Count)."
         if ($subject.Count -gt 0) {
           Write-Host "::group::Subject assemblies"
@@ -624,14 +632,25 @@ runs:
       run: |
         $listPath = 'subject-assemblies.txt'
 
+        # Absence now means what it says. The collect step writes this file
+        # unconditionally, so if it is missing that step genuinely did not run, which is an
+        # action-level problem rather than anything about the repository under test.
         if (-not (Test-Path $listPath)) {
-          Write-Host "::error title=Versioning::Subject assembly list missing. The step that collects this repository's build output did not run, so attribution has no subject set."
+          Write-Host "::error title=Versioning::Subject assembly list missing. The 'Collect subject assemblies' step did not run, so attribution has no subject set. This is a fault in the check, not in this repository: the step writes the file even when the build stages nothing, so its absence means it never executed."
           exit 1
         }
 
+        # Present but empty is a statement about the repository, and it has two quite
+        # different causes worth separating in the message. A repository can stage nothing
+        # because its PostBuild step is missing, or because it legitimately produces no
+        # type-bearing assembly and stages elsewhere. BHoM/Versioning_Toolkit is the second:
+        # its two projects stage to C:\ProgramData\BHoM\Upgrades\BHoMUpgrades\ and
+        # C:\ProgramData\BHoM\Developer\Versioning, while Get-AssemblyStamp scans
+        # C:\ProgramData\BHoM\Assemblies only, so the subject set is correctly empty and
+        # always will be. Whether that should fail or skip is not settled here.
         $subject = @(Get-Content $listPath | Where-Object { $_.Trim() })
         if ($subject.Count -eq 0) {
-          Write-Host "::error title=Versioning::This repository's build staged no assemblies. The solution built, but nothing reached C:\ProgramData\BHoM\Assemblies, so no failure could be attributed to this repository. Every BHoM project stages its output there through a PostBuild step; a repository producing none either built no assemblies or is missing that step."
+          Write-Host "::error title=Versioning::This repository's build staged no assemblies. The solution built and the collection step ran, but nothing new reached C:\ProgramData\BHoM\Assemblies, so no failure could be attributed to this repository. Check where this repository's projects copy their output: BHoM projects stage there through a PostBuild step, and a repository whose projects stage to another directory (or which builds no type-bearing assembly at all) will always produce an empty subject set. The answer is in the .csproj PostBuildEvent entries, not in CI."
           exit 1
         }
 
