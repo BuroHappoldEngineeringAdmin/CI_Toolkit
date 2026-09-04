@@ -83,6 +83,11 @@ public static class RunCommand
 
         var subjectNamespaces = BuildSubjectNamespaces(loaded, subjectFileNames);
 
+        // Every type and namespace actually present, built once. This is what separates a
+        // record the closure could never have resolved from a type this PR removed, and it
+        // is independent of attribution: it asks what exists here, not whose it is.
+        var typeIndex = BuildLoadedTypeIndex(loaded);
+
         // Attribution answers "is this failure ours"; classification answers "is it real".
         // Those are separate questions and this is the place the first one is answered, which
         // is why the declaring assembly is taken into account here rather than being used to
@@ -155,7 +160,7 @@ public static class RunCommand
                 return 1;
             }
 
-            var partial = ExtractFilteredResult(rawResult, isAttributable, unresolvableSkips, probeSignature, diagnostics, closure);
+            var partial = ExtractFilteredResult(rawResult, isAttributable, unresolvableSkips, probeSignature, diagnostics, closure, typeIndex);
             allFailures.AddRange(partial.Failures);
         }
 
@@ -254,7 +259,8 @@ public static class RunCommand
             VerifyEntryPoints: methods.Count,
             SubjectAssemblies: s_subjectAssemblyCount,
             SubjectTypes: s_subjectTypeCount,
-            DatasetVersions: testAll ? 0 : 1);
+            DatasetVersions: testAll ? 0 : 1,
+            RecordsUnverified: unresolvableSkips.Count);
 
         var result = new VersioningResult
         {
@@ -271,11 +277,17 @@ public static class RunCommand
         // Leads with the surface actually examined. An earlier version led with the entry-point
         // count, which is one per repository, so a coverage line intended to make a green
         // interpretable read "1" and undermined the field's whole purpose.
+        //
+        // The unverified count is on the same line rather than a separate warning, because the
+        // two numbers are only meaningful together: 1191 subject types checked reads as a clean
+        // sweep until you know 145 records were not verified. Stated even when zero, so a real
+        // clean sweep is distinguishable from one nobody counted.
         Console.WriteLine(
             $"Coverage: {coverage.SubjectTypes} subject type(s) across {coverage.SubjectAssemblies} subject assembl(ies), " +
             $"checked against {(testAll ? "all staged dataset versions" : "the previous dataset version")}; " +
             $"{coverage.LoadedAssemblies} assembl(ies) loaded; " +
-            $"{coverage.VerifyEntryPoints} FromJsonDatasets entry point(s) invoked");
+            $"{coverage.VerifyEntryPoints} FromJsonDatasets entry point(s) invoked; " +
+            $"{coverage.RecordsUnverified} record(s) attributed but not verified");
         if (configuration is not null)
             Console.WriteLine($"Configuration: {configuration}");
 
@@ -439,7 +451,8 @@ public static class RunCommand
     {
         var nsPrefixes = BuildNamespacePrefixes(loaded);
         return ExtractFilteredResult(
-            rawResult, (d, _) => (IsFromLoadedNamespace(d, nsPrefixes), AttributionBasis.NotRecorded));
+            rawResult, (d, _) => (IsFromLoadedNamespace(d, nsPrefixes), AttributionBasis.NotRecorded),
+            typeIndex: BuildLoadedTypeIndex(loaded));
     }
 
     public static VersioningResult ExtractFilteredResult(
@@ -448,7 +461,10 @@ public static class RunCommand
         List<UnverifiedFailure>? unresolvableSkips = null,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature = null,
         List<FailureDiagnostic>? diagnostics = null,
-        ClosureContext? closure = null)
+        ClosureContext? closure = null,
+        // Defaults to Empty so a caller that is not exercising resolution keeps the
+        // pre-existing behaviour rather than having findings reclassified underneath it.
+        LoadedTypeIndex? typeIndex = null)
     {
         if (rawResult is null)
             return new VersioningResult
@@ -459,7 +475,7 @@ public static class RunCommand
             };
 
         var failures = new List<FailureInfo>();
-        CollectLeafFailures(rawResult, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, depth: 0);
+        CollectLeafFailures(rawResult, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, typeIndex ?? LoadedTypeIndex.Empty, depth: 0);
 
         var status = failures.Count > 0 ? VersioningStatus.Error : VersioningStatus.Pass;
         return new VersioningResult
@@ -476,7 +492,8 @@ public static class RunCommand
         List<FailureInfo> failures,
         List<UnverifiedFailure>? unresolvableSkips,
         Func<string, string, string?, (string? Cause, ClassificationPath Path, IReadOnlyList<string> Candidates)>? probeSignature,
-        List<FailureDiagnostic>? diagnostics, ClosureContext? closure, int depth)
+        List<FailureDiagnostic>? diagnostics, ClosureContext? closure,
+        LoadedTypeIndex typeIndex, int depth)
     {
         // BHoM's TestResult tree has at most 3 levels under the root (outer → per-version
         // summary → individual type result). Depth 5 gives headroom for unexpected nesting
@@ -541,8 +558,12 @@ public static class RunCommand
                 ? $"{eventType}.{eventMethod}"
                 : desc;
 
-            string? cause = ClassifyUnresolvableCause(eventMessages);
-            var path = ClassificationPath.UnresolvableFromEvents;
+            var (cause, causeFromPayload) = ClassifyUnresolvableCause(eventMessages, typeIndex);
+            // The payload path reaches the same conclusion as the signature path but for a
+            // different reason, and the artefact needs to tell them apart.
+            var path = causeFromPayload
+                ? ClassificationPath.UnresolvableTypeAbsent
+                : ClassificationPath.UnresolvableFromEvents;
             IReadOnlyList<string> candidates = Array.Empty<string>();
 
             // No type-level cause recorded means the blocker may be in the signature
@@ -638,7 +659,7 @@ public static class RunCommand
             {
                 string childStatus = child.GetType().GetProperty("Status")?.GetValue(child)?.ToString() ?? "Pass";
                 if (childStatus is "Error" or "Warning")
-                    CollectLeafFailures(child, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, depth + 1);
+                    CollectLeafFailures(child, isAttributable, failures, unresolvableSkips, probeSignature, diagnostics, closure, typeIndex, depth + 1);
             }
         }
     }
@@ -1165,40 +1186,181 @@ public static class RunCommand
     }
 
     // A leaf failure carries its cause in the EventMessages FromJsonItem attached to it,
-    // one per type that could not be deserialised, e.g.
-    //   "Type Autodesk.Revit.DB.Document, RevitAPI, Version=9.0.0.0, ... failed to deserialise."
-    // followed by "Method <name> from { ...json... } failed to deserialise."
-    // When every named type is outside BHoM the failure says nothing about this repo's
-    // code: RevitAPI is mixed-mode native and cannot be loaded on .NET 5+ at all, so those
-    // methods can never resolve in CI regardless of the PR. Returns the first such type,
-    // or null when the failure is real. Anything naming a BH. type is real by default, so
-    // a genuine regression is never classified away.
-    public static string? ClassifyUnresolvableCause(IEnumerable<string> eventMessages)
+    // one per type that could not be deserialised. Three shapes occur, all verbatim from
+    // real runs:
+    //
+    //   method path, from the signature:
+    //     "Type Autodesk.Revit.DB.Document, RevitAPI, Version=9.0.0.0, ... failed to deserialise."
+    //   object path, from the payload, at any nesting depth:
+    //     "Failed to convert the string into a type: BH.oM.Adapters.GSA.MaterialFragments.Fabric"
+    //     "The type BH.oM.Adapters.GSA.MaterialFragments.Fabric from version 9.2 is unknown -> data returned as custom objects."
+    //
+    // Only the first shape was parsed before, which is why every object-record failure
+    // reached the caller with no cause at all. The second and third are emitted by
+    // BHoM_Engine's deserialiser (Deprecate.cs) for a nested type as readily as a
+    // top-level one, so a record poisoned by a fragment from a downstream toolkit names
+    // that fragment here.
+    //
+    // The verdict then turns on the loaded set, not on the name:
+    //
+    //   present in the loaded set          -> not a blocker, ignore it
+    //   absent, but its namespace IS loaded -> an assembly here owns that namespace and the
+    //                                          type is gone. A REMOVAL. Real, and must gate.
+    //   absent, and its namespace too       -> nothing in this closure could have supplied
+    //                                          it. Unverifiable, and says nothing about the
+    //                                          code under test.
+    //
+    // This replaces a `t.StartsWith("BH.")` test that could not work. Its intent was "could
+    // CI ever load this", and for RevitAPI the proxy held. It cannot hold generally, because
+    // every downstream BHoM toolkit type also starts with BH.: measured on BHoM/BHoM run
+    // 33849699768, all 145 findings named a BH. type and all 145 were closure artefacts.
+    // Worse, the test discarded a cause the function had already computed correctly one line
+    // above, which is the same discard-at-the-handoff fault as BHoM/internal-tickets#31.
+    //
+    // A genuine removal is still caught, and deliberately so: its namespace survives in the
+    // loaded assembly the type was deleted from, so it takes the middle branch. Where a
+    // record names both a removal and a closure gap the removal wins, because losing a real
+    // regression is the worse error and the removed type has its own record besides.
+    //
+    // An empty index means the caller is not exercising resolution; decline rather than
+    // guess, so nothing is reclassified on absent evidence.
+    // FromPayload distinguishes the shape that produced the cause, so the caller can record
+    // UnresolvableTypeAbsent (payload) separately from UnresolvableFromEvents (signature).
+    // Keyed on the shape rather than on whether a Method event is present, because a
+    // signature blocker does not always come with one.
+    public static (string? Cause, bool FromPayload) ClassifyUnresolvableCause(
+        IEnumerable<string> eventMessages, LoadedTypeIndex loaded)
     {
-        var namedTypes = new List<string>();
+        var named = new List<(string Type, bool FromPayload)>();
 
         foreach (string message in eventMessages)
         {
-            if (string.IsNullOrEmpty(message)
-                || !message.StartsWith("Type ", StringComparison.Ordinal)
-                || !message.Contains("failed to deserialise", StringComparison.Ordinal))
-                continue;
-
-            string identity = message["Type ".Length..];
-            int commaIdx = identity.IndexOf(',');
-            string bare = (commaIdx > 0 ? identity[..commaIdx] : identity).Trim();
-
-            if (bare.Length > 0)
-                namedTypes.Add(bare);
+            string? bare = NamedFailingType(message, out bool fromPayload);
+            if (bare is not null)
+                named.Add((bare, fromPayload));
         }
 
-        if (namedTypes.Count == 0)
+        if (named.Count == 0 || loaded.IsEmpty)
+            return (null, false);
+
+        (string Type, bool FromPayload)? unresolvable = null;
+
+        foreach (var (type, fromPayload) in named)
+        {
+            if (loaded.TypeFullNames.Contains(type))
+                continue;
+
+            int dot = type.LastIndexOf('.');
+            string ns = dot > 0 ? type[..dot] : string.Empty;
+
+            // Namespace present, type gone: a removal. Outranks anything else here.
+            if (ns.Length > 0 && loaded.Namespaces.Contains(ns))
+                return (null, false);
+
+            unresolvable ??= (type, fromPayload);
+        }
+
+        return unresolvable is null ? (null, false) : (unresolvable.Value.Type, unresolvable.Value.FromPayload);
+    }
+
+    // The three event shapes that name a type which failed to resolve. Returns the bare
+    // full name, or null when the message is not one of them. fromPayload is true for the
+    // two shapes the deserialiser emits about the record's own contents, false for the
+    // signature shape.
+    internal static string? NamedFailingType(string message) => NamedFailingType(message, out _);
+
+    internal static string? NamedFailingType(string message, out bool fromPayload)
+    {
+        fromPayload = false;
+        if (string.IsNullOrWhiteSpace(message))
             return null;
 
-        if (namedTypes.Any(t => t.StartsWith("BH.", StringComparison.Ordinal)))
-            return null;
+        const string convertPrefix = "Failed to convert the string into a type: ";
+        const string unknownPrefix = "The type ";
+        const string unknownMarker = " is unknown -> data returned as custom objects.";
 
-        return namedTypes[0];
+        string raw;
+        if (message.StartsWith("Type ", StringComparison.Ordinal)
+            && message.Contains("failed to deserialise", StringComparison.Ordinal))
+        {
+            raw = message["Type ".Length..];
+        }
+        else if (message.StartsWith(convertPrefix, StringComparison.Ordinal))
+        {
+            raw = message[convertPrefix.Length..];
+            fromPayload = true;
+        }
+        else if (message.StartsWith(unknownPrefix, StringComparison.Ordinal)
+                 && message.EndsWith(unknownMarker, StringComparison.Ordinal))
+        {
+            // "The type X from version 9.2 is unknown -> ...". The version clause is
+            // always present and always follows the type, so cut at " from version ".
+            raw = message[unknownPrefix.Length..^unknownMarker.Length];
+            int fromIdx = raw.LastIndexOf(" from version ", StringComparison.Ordinal);
+            if (fromIdx > 0)
+                raw = raw[..fromIdx];
+            fromPayload = true;
+        }
+        else
+        {
+            return null;
+        }
+
+        // Identities may be assembly-qualified; the comparison downstream is on the bare
+        // full name because that is what the loaded index holds.
+        int commaIdx = raw.IndexOf(',');
+        string bare = (commaIdx > 0 ? raw[..commaIdx] : raw).Trim();
+        return bare.Length > 0 ? bare : null;
+    }
+
+    // Every type and every exact namespace present in the loaded assemblies.
+    //
+    // Reflection over a loaded assembly can throw per-type (the same
+    // ReflectionTypeLoadException shape BuildSubjectNamespaces guards against), so a type
+    // that cannot be read is skipped rather than losing its whole assembly. A skipped type
+    // is a type this index does not know about, which biases towards "absent", which biases
+    // towards leaving a finding real. That is the safe direction.
+    public static LoadedTypeIndex BuildLoadedTypeIndex(IEnumerable<Assembly> assemblies)
+    {
+        var typeNames = new HashSet<string>(StringComparer.Ordinal);
+        var namespaces = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var asm in assemblies)
+        {
+            Type?[] types;
+            try
+            {
+                types = asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                types = ex.Types;
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var type in types)
+            {
+                if (type is null)
+                    continue;
+
+                try
+                {
+                    if (type.FullName is { Length: > 0 } full)
+                        typeNames.Add(full);
+                    if (type.Namespace is { Length: > 0 } ns)
+                        namespaces.Add(ns);
+                }
+                catch
+                {
+                    // Unreadable type; see the note above on why skipping is the safe bias.
+                }
+            }
+        }
+
+        return new LoadedTypeIndex(typeNames, namespaces);
     }
 
     // Classifies an exception thrown from invoking a versioning test method.

@@ -46,6 +46,40 @@ public enum ClassificationPath
     // one the subject did build (Revit_Core_Engine_2024 against a Release/2022 build), so
     // the code exists in the repo and simply was not compiled in this run.
     ConfigurationNotBuilt,
+
+    // A type the record needs is absent from the loaded set, and so is its whole
+    // namespace, so no assembly in this closure could have supplied it. The record
+    // cannot be verified here and says nothing about the code under test.
+    //
+    // Distinct from UnresolvableFromEvents (the same conclusion reached on the method
+    // path) and from NoMethodEvent (an attribution problem, not a resolution one), so the
+    // artefact separates "could not resolve it" from "could not attribute it".
+    UnresolvableTypeAbsent,
+}
+
+// The types and namespaces actually present in the loaded assemblies.
+//
+// This is the evidence that separates a closure gap from a genuine removal, and it is the
+// only thing available that can. A type absent from the loaded set whose namespace IS
+// loaded means an assembly here owns that namespace and the type is gone: a removal, and
+// real. A type absent whose namespace is absent too means nothing in this closure could
+// have supplied it: unverifiable, and not a statement about the code under test.
+//
+// Namespaces are exact, not prefixes. The name arrives from an event message as a full
+// type name, so its namespace is known exactly rather than inferred, which is why this can
+// be a set-membership test where attribution cannot.
+public sealed record LoadedTypeIndex(
+    HashSet<string> TypeFullNames,
+    HashSet<string> Namespaces)
+{
+    // Nothing loaded and nothing known. Used by callers not exercising resolution; the
+    // classifier declines to decide rather than guessing, so an absent index cannot
+    // silently reclassify anything.
+    public static LoadedTypeIndex Empty { get; } = new(
+        new HashSet<string>(StringComparer.Ordinal),
+        new HashSet<string>(StringComparer.Ordinal));
+
+    public bool IsEmpty => TypeFullNames.Count == 0 && Namespaces.Count == 0;
 }
 
 // Which evidence decided that a failure belongs to the subject repository.
@@ -126,7 +160,12 @@ public record CoverageCounts(
     int VerifyEntryPoints,
     int SubjectAssemblies,
     int SubjectTypes,
-    int DatasetVersions);
+    int DatasetVersions,
+    // Records attributed to this repository that could not be verified, for any reason.
+    // Present so a green cannot be read as a clean sweep of SubjectTypes: a run reporting
+    // 1191 types checked and 145 records unverified has not examined what the first number
+    // implies. Counts records, not types, because that is the unit the dataset iterates.
+    int RecordsUnverified = 0);
 
 public class VersioningResult
 {

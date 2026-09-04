@@ -806,6 +806,13 @@ runs:
 
         $rows = @()
         $unverified = 0
+        # Unverified splits into two different problems and the summary has to say which.
+        # "Could not resolve it" is a closure gap: a type the record needs is absent and so
+        # is its namespace, so nothing here could have supplied it. "Could not attribute it"
+        # is an ownership problem: the record resolved, but ownership was inferred from a
+        # namespace prefix. Different fixes, tracked separately (internal-tickets #32, #31).
+        $unresolved = 0
+        $unattributed = 0
         $coverage = $null
         $configuration = $null
         $status = $null
@@ -829,7 +836,14 @@ runs:
                 Cause   = $d.Cause
                 Context = if ($context.Count -gt 0) { $context -join '; ' } else { '' }
               }
-            } else { $unverified++ }
+            } else {
+              $unverified++
+              switch ($d.Path) {
+                'UnresolvableTypeAbsent' { $unresolved++ }
+                'UnresolvableFromEvents' { $unresolved++ }
+                default                  { $unattributed++ }
+              }
+            }
           }
         }
 
@@ -853,6 +867,10 @@ runs:
         $md += "| Classification | ``$classification`` |"
         $md += "| Attribution basis | ``$attributionBasis`` |"
         $md += "| Reported unverified | $unverified |"
+        if ($unverified -gt 0) {
+          $md += "| — could not be resolved (closure gap) | $unresolved |"
+          $md += "| — could not be attributed (inferred ownership) | $unattributed |"
+        }
         if ($coverage) {
           $md += "| Surface examined | $($coverage.SubjectTypes) subject types across $($coverage.SubjectAssemblies) subject assemblies |"
           $md += "| Dataset versions | $(if ($coverage.DatasetVersions -eq 0) { 'all staged' } else { 'previous only' }) |"
